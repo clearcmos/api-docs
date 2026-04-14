@@ -1,0 +1,18 @@
+# Generated docs output
+**/docs/
+
+# Incremental update caches
+**/.cache.json
+
+# Large raw spec files
+**/openapi.json
+**/openapi.yaml
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+*.swp
+*.swo
+*~
