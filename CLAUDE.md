@@ -29,6 +29,11 @@ Every fetch.py supports the same argparse flags:
 
 No other flags are required. Run with no args for a normal incremental sync.
 
+Some fetchers have additional flags for vendor-specific needs:
+
+- `sentinelone` requires `--base-url` and `--cookie`/`--cookie-file` (authenticated console).
+- `terraform` accepts `--provider org/name` (interactive picker if omitted with a TTY).
+
 ### Finding the source
 
 Prefer machine-readable specs over scraping HTML, in this order:
@@ -38,7 +43,11 @@ Prefer machine-readable specs over scraping HTML, in this order:
 3. **llms.txt / llms-full.txt** -- increasingly common. A single text file listing all doc pages, sometimes with a companion file containing the full content. Auth0 and Anthropic use this pattern.
 4. **Sitemaps** -- fetch `sitemap.xml` / `sitemap-index.xml` to discover all doc pages. Filter to the relevant subtree (e.g. `/api/resources/` vs SDK-specific duplicates).
 5. **Embedded data in HTML** -- some SPAs embed spec data in the page (e.g. Bitwarden stores its OpenAPI spec in an Inertia.js `data-page` attribute). Extract with regex, don't try to render JS.
-6. **HTML scraping** -- last resort. Some sites serve markdown alternates via `<link rel="alternate" type="text/markdown">`.
+6. **Postman collections** -- some vendors publish API docs via Postman. Fetch the collection JSON and parse the folder/endpoint structure. Kandji uses this pattern.
+7. **Terraform Registry API** -- for Terraform provider docs. The v1/v2 registry API returns provider metadata and doc content. Provider-agnostic with `--provider` flag.
+8. **Webpack bundle extraction** -- some Docusaurus SPAs embed content in webpack chunks. Extract route mappings from main.js, fetch chunks, decompress base64+zlib OpenAPI specs. Rippling uses this pattern.
+9. **Authenticated APIs** -- some vendors require auth to access their API spec (e.g. SentinelOne management console). Accept credentials via CLI flags, never hardcode tenant URLs.
+10. **HTML scraping** -- last resort. Some sites serve markdown alternates via `<link rel="alternate" type="text/markdown">`.
 
 ### Caching and incremental updates
 
@@ -71,7 +80,7 @@ When working from an OpenAPI spec:
 
 Fetchers use only Python standard library (`urllib`, `json`, `hashlib`, `argparse`, etc.). No `requests`, no `pyyaml`, no `beautifulsoup`. This keeps the scripts zero-dependency and runnable anywhere Python 3.12+ is available.
 
-The one exception is YAML-only specs. If a vendor only publishes YAML (no JSON alternative), `pyyaml` is acceptable. Oracle is the current example of this.
+The one exception is YAML-only specs. If a vendor only publishes YAML (no JSON alternative), `pyyaml` is acceptable. Current examples: clickup (V3 spec), langfuse, okta, oracle.
 
 ### Concurrency
 
@@ -88,7 +97,13 @@ Every fetcher independently implements these patterns (not shared code, but cons
 - `resolve_ref(ref, spec)` -- walk `$ref` pointers in OpenAPI specs
 - `schema_to_markdown(schema, spec, depth, seen)` -- recursive schema renderer with circular-ref protection
 
-When creating a new fetcher, copy these patterns from an existing one (cloudflare is a clean OpenAPI example, auth0 is a clean llms.txt example) rather than inventing new approaches.
+When creating a new fetcher, copy these patterns from an existing one rather than inventing new approaches:
+
+- **cloudflare** -- clean single OpenAPI spec example.
+- **auth0** -- clean llms.txt example.
+- **immich** -- dual-source example (OpenAPI spec + HTML scraping via sitemap).
+- **clickup** -- dual-source example (two OpenAPI specs + sitemap HTML guides).
+- **kandji** -- Postman collection parsing example.
 
 ## Gitignore
 
@@ -103,4 +118,25 @@ Current patterns for source artifacts:
 **/openapi*.yaml
 **/google-api-discovery.json
 **/spec-index.json
+**/collection.json
+**/api-spec.json
+**/provider-docs.json
+**/provider-index.json
 ```
+
+## Unified runner
+
+`run.py` at the repo root discovers all `{vendor}/fetch.py` scripts dynamically and provides a single entry point:
+
+```
+python run.py                                    # interactive fzf picker (multi-select with Tab)
+python run.py cloudflare okta                    # run specific vendors
+python run.py --all                              # run all (skips vendors needing extra args)
+python run.py --all --dry-run                    # dry-run everything
+python run.py --list                             # list discovered vendors
+python run.py terraform -- --provider org/name   # vendor-specific args after --
+```
+
+Vendors marked with `# requires-interactive` or having `required=True` argparse args are skipped in `--all` mode. The `--` separator forwards everything after it to the vendor script.
+
+When adding a new fetcher, `run.py` picks it up automatically -- no registration needed.
