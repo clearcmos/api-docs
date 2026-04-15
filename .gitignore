@@ -9,6 +9,10 @@
 **/openapi*.yaml
 **/google-api-discovery.json
 **/spec-index.json
+**/provider-docs.json
+**/provider-index.json
+**/api-spec.json
+**/collection.json
 
 # Python
 __pycache__/
