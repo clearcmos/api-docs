@@ -5,8 +5,10 @@
 **/.cache.json
 
 # Large raw spec files
-**/openapi.json
-**/openapi.yaml
+**/openapi*.json
+**/openapi*.yaml
+**/google-api-discovery.json
+**/spec-index.json
 
 # Python
 __pycache__/
