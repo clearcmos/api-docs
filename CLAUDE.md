@@ -38,7 +38,7 @@ Some fetchers have additional flags for vendor-specific needs:
 
 Prefer machine-readable specs over scraping HTML, in this order:
 
-1. **OpenAPI/Swagger specs** -- best option. Check the vendor's GitHub org for `api-schemas`, `openapi-spec`, or similar repos.
+1. **OpenAPI/Swagger specs** -- best option. Check the vendor's GitHub org for `api-schemas`, `openapi-spec`, or similar repos. Self-hosted apps often serve a Swagger spec from the running server itself (e.g. Vikunja exposes it at `/api/v1/docs.json` on any instance); point the fetcher at a public demo deployment with a `--spec-url` flag.
 2. **Discovery documents** -- Google uses this pattern. A single index URL returns a list of all API specs.
 3. **llms.txt / llms-full.txt** -- increasingly common. A single text file listing all doc pages, sometimes with a companion file containing the full content. Auth0 and Anthropic use this pattern.
 4. **Sitemaps** -- fetch `sitemap.xml` / `sitemap-index.xml` to discover all doc pages. Filter to the relevant subtree (e.g. `/api/resources/` vs SDK-specific duplicates).
@@ -101,9 +101,12 @@ When creating a new fetcher, copy these patterns from an existing one rather tha
 
 - **cloudflare** -- clean single OpenAPI spec example.
 - **auth0** -- clean llms.txt example.
+- **1password** -- sitemap + llms.txt union example; each page has a `.md` alternate fetched directly.
 - **immich** -- dual-source example (OpenAPI spec + HTML scraping via sitemap).
 - **clickup** -- dual-source example (two OpenAPI specs + sitemap HTML guides).
 - **kandji** -- Postman collection parsing example.
+- **vikunja** -- Swagger 2.0 example (spec fetched live from a running instance; handles `definitions`, body params, and `responses[code].schema`).
+- **keycloak** -- sitemap-filtered AsciiDoc HTML scraping example. No machine-readable spec is published; each guide page is an AsciiDoc-rendered HTML with content in `<div id="guide-body">`, and the monolithic reference manuals live under `/docs/latest/*/index.html` with content in `<div id="content">`. Converts to markdown via a custom `html.parser.HTMLParser` subclass that handles AsciiDoc-specific patterns (admonition blocks, listing blocks, heading anchors).
 
 ## Gitignore
 

@@ -240,8 +240,9 @@ def sync(args: argparse.Namespace) -> None:
     if not args.dry_run:
         os.makedirs(DOCS_DIR, exist_ok=True)
 
-    added = 0
-    updated = 0
+    added_items: list[str] = []
+    updated_items: list[str] = []
+    removed_items: list[str] = []
     unchanged = 0
     errors = 0
     new_cache = {}
@@ -305,10 +306,13 @@ def sync(args: argparse.Namespace) -> None:
                 "url": page["url"],
             }
 
+            label = page["title"] or page["slug"]
+            location = f"{category}/{page['filename']}"
+            entry = f"{label} ({location})"
             if is_new:
-                added += 1
+                added_items.append(entry)
             else:
-                updated += 1
+                updated_items.append(entry)
 
             # Small delay to be polite to the server
             time.sleep(0.2)
@@ -349,10 +353,11 @@ def sync(args: argparse.Namespace) -> None:
                 "sha256": content_hash,
                 "last_updated": datetime.now(timezone.utc).isoformat(),
             }
+            entry = f"{category} index ({category}/README.md)"
             if is_new:
-                added += 1
+                added_items.append(entry)
             else:
-                updated += 1
+                updated_items.append(entry)
 
     # Write top-level README
     main_content = build_main_readme(page_plan)
@@ -362,7 +367,6 @@ def sync(args: argparse.Namespace) -> None:
             f.write(main_content)
 
     # Detect removals
-    removed = 0
     for old_key in sorted(cache):
         if old_key not in new_cache:
             parts = old_key.split(":", 1)
@@ -375,7 +379,9 @@ def sync(args: argparse.Namespace) -> None:
                         os.remove(old_path)
                         if args.verbose:
                             print(f"  REMOVE {parts[0]}/{parts[1]}")
-                    removed += 1
+                    old_title = cache.get(old_key, {}).get("title", "")
+                    label = old_title or parts[1].removesuffix(".md")
+                    removed_items.append(f"{label} ({parts[0]}/{parts[1]})")
 
     # Clean up empty directories
     if not args.dry_run:
@@ -390,13 +396,24 @@ def sync(args: argparse.Namespace) -> None:
         save_cache(new_cache)
 
     print(f"\nSync complete:")
-    print(f"  Added:      {added}")
-    print(f"  Updated:    {updated}")
+    print(f"  Added:      {len(added_items)}")
+    print(f"  Updated:    {len(updated_items)}")
     print(f"  Unchanged:  {unchanged}")
     print(f"  Errors:     {errors}")
-    print(f"  Removed:    {removed}")
+    print(f"  Removed:    {len(removed_items)}")
     print(f"  Categories: {len(categories)}")
     print(f"  Total pages: {total_pages}")
+
+    def print_section(label: str, items: list[str]) -> None:
+        if not items:
+            return
+        print(f"\n{label}:")
+        for item in sorted(items, key=str.lower):
+            print(f"  - {item}")
+
+    print_section("Added pages", added_items)
+    print_section("Updated pages", updated_items)
+    print_section("Removed pages", removed_items)
 
 
 def main():
