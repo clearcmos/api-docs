@@ -14,12 +14,14 @@ Part 1 -- API docs:
   - Identity Provider API (IdP federation endpoints)
 
 Part 2 -- Help docs:
-  Scrapes help.okta.com, a MadCap Flare site. The TOC is discovered via
-  HelpSystem.xml -> TOC root JS -> TOC chunk JS files. Each page is fetched,
-  HTML is converted to markdown via stdlib html.parser.
+  Discovers the current Okta Identity Engine help corpus from its sitemap.
+  Pages use DITA-generated HTML; each page is fetched concurrently and
+  converted to markdown via stdlib html.parser. ETags avoid retransferring
+  unchanged pages after the first successful sync.
 """
 
 import argparse
+import gzip
 import hashlib
 import html.parser
 import json
@@ -74,11 +76,11 @@ API_SPECS = {
     },
 }
 
-HELP_BASE_URL = "https://help.okta.com/en-us"
-HELP_DATA_URL = f"{HELP_BASE_URL}/Data/Tocs"
+HELP_BASE_URL = "https://help.okta.com/oie/en-us"
+HELP_SITEMAP_URL = f"{HELP_BASE_URL}/sitemap.xml"
 
-MAX_WORKERS = 8
-REQUEST_DELAY = 0.1
+MAX_WORKERS = 30
+REQUEST_DELAY = 0
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
@@ -99,23 +101,46 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "okta-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "okta-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
 
 
-def fetch_url_with_retry(url: str, timeout: int = 30) -> str | None:
-    """Fetch URL with retries and back-off for rate limiting."""
+def fetch_url_with_retry(
+    url: str, timeout: int = 30, etag: str | None = None
+) -> tuple[str | None, str | None, bool]:
+    """Fetch a URL with retries, gzip, and optional ETag validation."""
     for attempt in range(MAX_RETRIES):
-        req = Request(url, headers={"User-Agent": "okta-docs-fetcher/1.0"})
+        headers = {
+            "User-Agent": "okta-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        }
+        if etag:
+            headers["If-None-Match"] = etag
+        req = Request(url, headers=headers)
         try:
             with urlopen(req, timeout=timeout) as resp:
-                return resp.read().decode("utf-8")
+                data = resp.read()
+                if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                    data = gzip.decompress(data)
+                return (
+                    data.decode("utf-8"),
+                    resp.headers.get("ETag"),
+                    False,
+                )
         except HTTPError as e:
+            if e.code == 304:
+                return None, e.headers.get("ETag") or etag, True
             if e.code in (429, 503) and attempt < MAX_RETRIES - 1:
                 wait = RETRY_DELAY * (2 ** attempt)
                 print(
@@ -126,19 +151,58 @@ def fetch_url_with_retry(url: str, timeout: int = 30) -> str | None:
                 time.sleep(wait)
                 continue
             if e.code == 404:
-                return None
+                return None, None, False
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY * (2 ** attempt))
                 continue
             print(f"ERROR: Failed after {MAX_RETRIES} attempts: {url}: {e}", file=sys.stderr)
-            return None
+            return None, None, False
         except (URLError, TimeoutError, OSError) as e:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY * (2 ** attempt))
                 continue
             print(f"ERROR: Failed after {MAX_RETRIES} attempts: {url}: {e}", file=sys.stderr)
-            return None
-    return None
+            return None, None, False
+    return None, None, False
+
+
+def fetch_etag_with_retry(
+    url: str, timeout: int = 30
+) -> tuple[str | None, bool]:
+    """Fetch only response headers. Returns (ETag, request_succeeded)."""
+    for attempt in range(MAX_RETRIES):
+        req = Request(
+            url,
+            method="HEAD",
+            headers={
+                "User-Agent": "okta-docs-fetcher/1.0",
+                "Accept-Encoding": "gzip",
+            },
+        )
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return resp.headers.get("ETag"), True
+        except HTTPError as e:
+            if e.code == 404:
+                return None, True
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+                continue
+            print(
+                f"ERROR: HEAD failed after {MAX_RETRIES} attempts: {url}: {e}",
+                file=sys.stderr,
+            )
+            return None, False
+        except (URLError, TimeoutError, OSError) as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+                continue
+            print(
+                f"ERROR: HEAD failed after {MAX_RETRIES} attempts: {url}: {e}",
+                file=sys.stderr,
+            )
+            return None, False
+    return None, False
 
 
 def sanitize_filename(name: str) -> str:
@@ -516,6 +580,7 @@ class MadCapExtractor(html.parser.HTMLParser):
                 or (tag == "div" and "mc-body" in cls)
                 or (tag == "div" and "body-container" in cls)
                 or (tag == "div" and "okta-topics" in cls)
+                or (tag == "div" and "topic-content" in cls)
                 or attr_dict.get("data-mc-content-body") == "True"
             ):
                 self._in_content = True
@@ -747,7 +812,7 @@ class MadCapExtractor(html.parser.HTMLParser):
                 if href and not href.startswith("#") and not href.startswith("javascript:"):
                     # Convert relative URLs to absolute
                     if not href.startswith("http"):
-                        href = f"https://help.okta.com/en-us/content/topics/{href}"
+                        href = f"{HELP_BASE_URL}/content/topics/{href}"
                     self._current_line += f"]({href})"
                 else:
                     self._current_line += "]"
@@ -941,7 +1006,7 @@ class MadCapExtractor(html.parser.HTMLParser):
 
 
 def html_to_markdown(html_content: str) -> tuple[str, str]:
-    """Convert MadCap Flare HTML to markdown. Returns (title, markdown_content)."""
+    """Convert Okta DITA HTML to markdown. Returns (title, markdown_content)."""
     parser = MadCapExtractor()
     parser.feed(html_content)
     return parser.get_title(), parser.get_markdown()
@@ -1108,11 +1173,25 @@ def sync_api(
 
     spec_summaries: list[tuple[str, str, str]] = []  # (key, name, description)
 
+    print(f"  Fetching {len(API_SPECS)} specs concurrently...")
+    raw_specs: dict[str, str | None] = {}
+    with ThreadPoolExecutor(max_workers=len(API_SPECS)) as pool:
+        futures = {
+            pool.submit(fetch_url, info["url"]): key
+            for key, info in API_SPECS.items()
+        }
+        for future in as_completed(futures):
+            raw_specs[futures[future]] = future.result()
+
     for spec_key, spec_info in API_SPECS.items():
-        print(f"  Fetching {spec_info['name']}...")
-        raw_yaml_content = fetch_url(spec_info["url"])
+        print(f"  Processing {spec_info['name']}...")
+        raw_yaml_content = raw_specs.get(spec_key)
         if not raw_yaml_content:
             print(f"  ERROR: Could not fetch {spec_info['name']}, skipping", file=sys.stderr)
+            prefix = spec_info["cache_prefix"]
+            for key, value in cache.items():
+                if key.startswith(f"{prefix}:"):
+                    new_cache[key] = value
             continue
 
         try:
@@ -1170,102 +1249,35 @@ def sync_api(
 
 
 # ---------------------------------------------------------------------------
-# Part 2: Help docs (HTML scraping from help.okta.com)
+# Part 2: Help docs (DITA HTML scraping from help.okta.com)
 # ---------------------------------------------------------------------------
 
 
-def fetch_toc_metadata() -> str:
-    """Fetch HelpSystem.xml to find the TOC root file path."""
-    url = f"{HELP_BASE_URL}/Data/HelpSystem.xml"
-    print(f"  Fetching help system metadata from {url}...")
-    raw = fetch_url(url)
+def fetch_all_help_pages() -> dict[str, str]:
+    """Fetch the current DITA site's sitemap and return {path: title}."""
+    print(f"  Fetching help sitemap from {HELP_SITEMAP_URL}...")
+    raw = fetch_url(HELP_SITEMAP_URL)
     if not raw:
-        raise RuntimeError("Could not fetch HelpSystem.xml")
-
-    match = re.search(r'Toc="([^"]+)"', raw)
-    if not match:
-        raise ValueError("Could not find TOC reference in HelpSystem.xml")
-
-    toc_path = match.group(1)
-    print(f"    TOC root: {toc_path}")
-    return toc_path
-
-
-def fetch_toc_root(toc_path: str) -> tuple[int, str]:
-    """Fetch the TOC root JS file to get chunk count and prefix."""
-    url = f"{HELP_BASE_URL}/{toc_path}"
-    print(f"  Fetching TOC root from {url}...")
-    raw = fetch_url(url)
-    if not raw:
-        raise RuntimeError(f"Could not fetch TOC root: {url}")
-
-    js = raw.strip()
-    num_match = re.search(r"numchunks:(\d+)", js)
-    prefix_match = re.search(r"prefix:'([^']+)'", js)
-
-    if not num_match or not prefix_match:
-        raise ValueError("Could not parse TOC root structure")
-
-    num_chunks = int(num_match.group(1))
-    prefix = prefix_match.group(1)
-    print(f"    Found {num_chunks} TOC chunks with prefix '{prefix}'")
-    return num_chunks, prefix
-
-
-def parse_toc_chunk(js_content: str) -> dict[str, str]:
-    """Parse a MadCap Flare TOC chunk JS file into a dict of path -> title."""
-    content = js_content.strip()
-    # Remove the define() wrapper
-    content = re.sub(r"^define\(", "", content)
-    content = re.sub(r"\);$", "", content)
-
-    # Convert JS object to valid JSON:
-    # Replace single quotes with double quotes
-    content = content.replace("'", '"')
-    # Quote unquoted object keys
-    content = re.sub(r'(?<=[{,])(\w+):', r'"\1":', content)
-
+        raise RuntimeError("Could not fetch help sitemap")
     try:
-        obj = json.loads(content)
-    except json.JSONDecodeError:
-        return {}
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        raise ValueError(f"Could not parse help sitemap: {e}") from e
 
     pages: dict[str, str] = {}
-    for path, data in obj.items():
-        if not isinstance(data, dict):
+    prefix = HELP_BASE_URL.rstrip("/")
+    for loc in root.iter():
+        if not loc.tag.endswith("loc") or not loc.text:
             continue
-        titles = data.get("t", [""])
-        title = titles[0] if isinstance(titles, list) and titles else str(titles)
-        pages[path] = title
-
+        url = loc.text.strip()
+        if not url.startswith(prefix + "/"):
+            continue
+        path = url[len(prefix):]
+        if path.lower().endswith((".htm", ".html")):
+            # Titles are extracted from each page's <title>/<h1>.
+            pages[path] = ""
+    print(f"  Total help pages found: {len(pages)}")
     return pages
-
-
-def fetch_all_help_pages() -> dict[str, str]:
-    """Fetch the complete TOC and return {path: title} for all help pages."""
-    toc_path = fetch_toc_metadata()
-    num_chunks, prefix = fetch_toc_root(toc_path)
-
-    # Determine the base URL for chunks from the toc_path
-    toc_dir = "/".join(toc_path.split("/")[:-1])
-    all_pages: dict[str, str] = {}
-
-    print(f"  Fetching {num_chunks} TOC chunks...")
-    for i in range(num_chunks):
-        chunk_url = f"{HELP_BASE_URL}/{toc_dir}/{prefix}{i}.js"
-        raw = fetch_url(chunk_url)
-        if not raw:
-            print(f"    WARNING: Could not fetch chunk {i}", file=sys.stderr)
-            continue
-
-        pages = parse_toc_chunk(raw)
-        all_pages.update(pages)
-        if i % 10 == 0 or i == num_chunks - 1:
-            print(f"    Chunk {i}/{num_chunks - 1}: {len(pages)} pages (total: {len(all_pages)})")
-        time.sleep(REQUEST_DELAY)
-
-    print(f"  Total help pages found: {len(all_pages)}")
-    return all_pages
 
 
 def sanitize_help_path(url_path: str) -> str:
@@ -1287,7 +1299,12 @@ def sync_help(
         all_pages = fetch_all_help_pages()
     except (RuntimeError, ValueError) as e:
         print(f"  ERROR: {e}", file=sys.stderr)
-        return 0, 0, 0, 0
+        carried = 0
+        for key, value in cache.items():
+            if key.startswith("help:"):
+                new_cache[key] = value
+                carried += 1
+        return 0, 0, carried, 0
 
     if not all_pages:
         print("  No help pages found")
@@ -1321,12 +1338,10 @@ def sync_help(
     completed = [0]  # Use list for mutability in closure
     lock_print = __import__("threading").Lock()
 
-    def process_page(url_path: str, title: str) -> tuple[str, str, str, str, str, str]:
-        """Fetch and process a single help page. Returns (status, cache_key, content_hash, file_path, label, content)."""
-        time.sleep(REQUEST_DELAY)
-        url = f"{HELP_BASE_URL}{url_path}"
-        raw_html = fetch_url_with_retry(url)
-
+    def process_page(
+        url_path: str, title: str
+    ) -> tuple[str, str, str, str, str, str, str, str | None]:
+        """Fetch and process a single help page."""
         clean_path = sanitize_help_path(url_path)
         parts = clean_path.split("/")
         filename = parts[-1] + ".md"
@@ -1339,23 +1354,61 @@ def sync_help(
             target_dir = HELP_DOCS_DIR
         file_path = os.path.join(target_dir, filename)
         label = f"help/{subdir}/{filename}" if subdir else f"help/{filename}"
+        previous = cache.get(cache_key, {})
+        display_title = previous.get("title") or title or filename.replace(".md", "")
+
+        if REQUEST_DELAY:
+            time.sleep(REQUEST_DELAY)
+        url = f"{HELP_BASE_URL}{url_path}"
+        request_etag = previous.get("etag") if os.path.exists(file_path) else None
+        if request_etag:
+            head_etag, head_succeeded = fetch_etag_with_retry(url)
+            if head_succeeded and head_etag == request_etag:
+                return (
+                    "unchanged", cache_key, "", file_path, label, "",
+                    display_title, head_etag,
+                )
+        raw_html, response_etag, not_modified = fetch_url_with_retry(
+            url, etag=request_etag)
+        if not_modified:
+            return (
+                "unchanged", cache_key, "", file_path, label, "",
+                display_title, response_etag,
+            )
 
         if not raw_html:
-            return ("failed", cache_key, "", file_path, label, "")
+            return (
+                "failed", cache_key, "", file_path, label, "",
+                display_title, None,
+            )
 
         page_title, markdown = html_to_markdown(raw_html)
         if not markdown.strip() or len(markdown.strip()) < 50:
-            return ("skipped", cache_key, "", file_path, label, "")
+            return (
+                "skipped", cache_key, "", file_path, label, "",
+                display_title, response_etag,
+            )
 
-        # Build full page content with header
+        # Build full page content with header. The DITA article usually repeats
+        # its title as an h1, which would otherwise duplicate our stable header.
         display_title = title or page_title or filename.replace(".md", "")
+        markdown_lines = markdown.lstrip().splitlines()
+        if (
+            markdown_lines
+            and markdown_lines[0].strip().casefold()
+            == f"# {display_title}".casefold()
+        ):
+            markdown = "\n".join(markdown_lines[1:]).lstrip()
         content = f"# {display_title}\n\n"
-        content += f"**Source:** https://help.okta.com/en-us{url_path}\n\n"
+        content += f"**Source:** {HELP_BASE_URL}{url_path}\n\n"
         content += "---\n\n"
         content += markdown
 
         content_hash = sha256(content)
-        return ("ok", cache_key, content_hash, file_path, label, content)
+        return (
+            "ok", cache_key, content_hash, file_path, label, content,
+            display_title, response_etag,
+        )
 
     # Process pages concurrently
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -1367,7 +1420,10 @@ def sync_help(
         for future in as_completed(futures):
             url_path, title = futures[future]
             try:
-                status, cache_key, content_hash, file_path, label, content = future.result()
+                (
+                    status, cache_key, content_hash, file_path, label, content,
+                    display_title, response_etag,
+                ) = future.result()
             except Exception as e:
                 print(f"    ERROR processing {url_path}: {e}", file=sys.stderr)
                 failed += 1
@@ -1380,19 +1436,37 @@ def sync_help(
             subdir = "/".join(parts[:-1]) if len(parts) > 1 else ""
             section = parts[0] if len(parts) > 1 else "root"
 
+            preserve_existing = (
+                cache_key in cache and os.path.exists(file_path)
+            )
+            if status in ("ok", "unchanged") or preserve_existing:
+                sections.setdefault(section, []).append(
+                    (filename, display_title, url_path))
+
             if status == "failed":
                 failed += 1
+                if preserve_existing:
+                    new_cache[cache_key] = cache[cache_key]
             elif status == "skipped":
-                pass  # empty content, skip
+                if preserve_existing:
+                    new_cache[cache_key] = cache[cache_key]
+            elif status == "unchanged":
+                unchanged += 1
+                new_cache[cache_key] = {
+                    **cache[cache_key],
+                    "etag": response_etag,
+                    "title": display_title,
+                    "url": url_path,
+                }
             elif status == "ok":
-                # Track section membership
-                with lock_print:
-                    if section not in sections:
-                        sections[section] = []
-                    sections[section].append((filename, title or filename.replace(".md", ""), url_path))
-
                 # Cache check
                 cache_status = cache_check(cache, new_cache, cache_key, content_hash, file_path)
+                new_cache[cache_key] = {
+                    **new_cache[cache_key],
+                    "etag": response_etag,
+                    "title": display_title,
+                    "url": url_path,
+                }
                 if cache_status == "unchanged":
                     unchanged += 1
                 else:

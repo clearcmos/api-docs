@@ -35,6 +35,7 @@ updated, or removed.
 """
 
 import argparse
+import gzip
 import hashlib
 import html as html_module
 import html.parser
@@ -42,6 +43,7 @@ import json
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -56,6 +58,7 @@ PAGES = {
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
+SOURCE_CACHE_PREFIX = "__source__:"
 
 # Map h1 id of a part to its directory name under manual/.
 PART_DIRS = {
@@ -78,18 +81,35 @@ def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def fetch_url(url: str, timeout: int = 180) -> str | None:
-    req = Request(url, headers={
+def fetch_url(
+    url: str, timeout: int = 180, etag: str | None = None
+) -> tuple[str | None, str | None, bool]:
+    headers = {
         "User-Agent": "nixos-docs-fetcher/1.0",
         "Accept": "text/html,application/xhtml+xml,*/*",
-    })
+        "Accept-Encoding": "gzip",
+    }
+    if etag:
+        headers["If-None-Match"] = etag
+    req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
-            return data.decode("utf-8", errors="replace")
-    except (HTTPError, URLError, TimeoutError, OSError) as e:
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return (
+                data.decode("utf-8", errors="replace"),
+                resp.headers.get("ETag"),
+                False,
+            )
+    except HTTPError as e:
+        if e.code == 304:
+            return None, e.headers.get("ETag") or etag, True
         print(f"  ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
-        return None
+        return None, None, False
+    except (URLError, TimeoutError, OSError) as e:
+        print(f"  ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
+        return None, None, False
 
 
 def load_cache() -> dict:
@@ -1196,16 +1216,77 @@ def sync(args: argparse.Namespace) -> None:
         (added if is_new else updated).append(f"{label_for_log} ({rel_path})")
 
     # --- Fetch all three pages -----------------------------------------
-    print("Fetching pages...")
+    print("Fetching pages concurrently...")
+    source_results: dict[str, tuple[str | None, str | None, bool]] = {}
+    with ThreadPoolExecutor(max_workers=len(PAGES)) as pool:
+        futures = {}
+        for slug, url in PAGES.items():
+            source_key = f"{SOURCE_CACHE_PREFIX}{slug}"
+            etag = cache.get(source_key, {}).get("etag")
+            print(f"  GET {url}" + (" (conditional)" if etag else ""))
+            futures[pool.submit(fetch_url, url, 180, etag)] = slug
+        for future in as_completed(futures):
+            slug = futures[future]
+            source_results[slug] = future.result()
+
+    if any(text is None and not unchanged_source
+           for text, _, unchanged_source in source_results.values()):
+        print("ERROR: one or more source pages could not be fetched",
+              file=sys.stderr)
+        sys.exit(1)
+
+    output_entries = {
+        key: value for key, value in cache.items()
+        if not key.startswith(SOURCE_CACHE_PREFIX)
+    }
+    outputs_complete = (
+        bool(output_entries)
+        and all(os.path.exists(os.path.join(DOCS_DIR, key))
+                for key in output_entries)
+    )
+    if (
+        len(source_results) == len(PAGES)
+        and all(result[2] for result in source_results.values())
+        and outputs_complete
+    ):
+        print("  All source ETags unchanged; skipping download and conversion")
+        print("\nSync complete:")
+        print("  Added:     0")
+        print("  Updated:   0")
+        print(f"  Unchanged: {len(output_entries)}")
+        print("  Removed:   0")
+        return
+
+    # If one source changed, fetch bodies for the 304 sources too so the
+    # cross-source indexes can be rebuilt consistently. Also repairs a
+    # missing generated file when all sources returned 304.
+    missing_bodies = [
+        slug for slug, (text, _, _) in source_results.items() if text is None
+    ]
+    if missing_bodies:
+        print(f"  Refetching {len(missing_bodies)} unchanged source bodies "
+              "for a complete rebuild...")
+        with ThreadPoolExecutor(max_workers=len(missing_bodies)) as pool:
+            futures = {
+                pool.submit(fetch_url, PAGES[slug]): slug
+                for slug in missing_bodies
+            }
+            for future in as_completed(futures):
+                slug = futures[future]
+                source_results[slug] = future.result()
+
     pages: dict[str, str] = {}
     for slug, url in PAGES.items():
-        print(f"  GET {url}")
-        text = fetch_url(url)
+        text, etag, _ = source_results[slug]
         if text is None:
             print(f"ERROR: could not fetch {url}", file=sys.stderr)
             sys.exit(1)
         pages[slug] = text
-        print(f"    {len(text):,} bytes")
+        new_cache[f"{SOURCE_CACHE_PREFIX}{slug}"] = {
+            "etag": etag or "",
+            "url": url,
+        }
+        print(f"    {slug}: {len(text):,} bytes")
 
     if not args.dry_run:
         os.makedirs(DOCS_DIR, exist_ok=True)
@@ -1303,6 +1384,8 @@ def sync(args: argparse.Namespace) -> None:
     # --- Detect removals -----------------------------------------------
     for old_key in sorted(cache):
         if old_key in new_cache:
+            continue
+        if old_key.startswith(SOURCE_CACHE_PREFIX):
             continue
         old_path = os.path.join(DOCS_DIR, old_key)
         if not os.path.exists(old_path):

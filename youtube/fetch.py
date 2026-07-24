@@ -33,6 +33,7 @@ Output layout:
 """
 
 import argparse
+import gzip
 import hashlib
 import html.parser
 import json
@@ -51,7 +52,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 24
 
 # Resource overview pages that exist on the site but are not linked from the
 # /youtube/v3/docs index. Discovered by probing /youtube/v3/docs/{name}.
@@ -76,10 +77,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "youtube-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "youtube-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8", errors="replace")
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -972,31 +979,36 @@ def sync(args: argparse.Namespace) -> None:
     extras: list[str] = []
 
     for rel, (url, content) in sorted(results.items()):
+        out_path = os.path.join(DOCS_DIR, rel)
+        cached = cache.get(rel, {})
         if content is None:
             failed += 1
-            continue
-        out_path = os.path.join(DOCS_DIR, rel)
-        h = sha256(content)
-        cached = cache.get(rel, {})
-        if cached.get("sha256") == h and os.path.exists(out_path):
-            unchanged += 1
-            new_cache[rel] = cached
-        else:
-            is_new = rel not in cache or not os.path.exists(out_path)
-            label = "ADD" if is_new else "UPDATE"
-            write_file(out_path, content, dry_run=args.dry_run,
-                       verbose=args.verbose, label=label)
-            new_cache[rel] = {
-                "sha256": h,
-                "url": url,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
-            }
-            if is_new:
-                added += 1
+            if cached and os.path.exists(out_path):
+                unchanged += 1
+                new_cache[rel] = cached
             else:
-                updated += 1
-                if not args.verbose:
-                    print(f"  UPDATE {rel}")
+                continue
+        else:
+            h = sha256(content)
+            if cached.get("sha256") == h and os.path.exists(out_path):
+                unchanged += 1
+                new_cache[rel] = cached
+            else:
+                is_new = rel not in cache or not os.path.exists(out_path)
+                label = "ADD" if is_new else "UPDATE"
+                write_file(out_path, content, dry_run=args.dry_run,
+                           verbose=args.verbose, label=label)
+                new_cache[rel] = {
+                    "sha256": h,
+                    "url": url,
+                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                }
+                if is_new:
+                    added += 1
+                else:
+                    updated += 1
+                    if not args.verbose:
+                        print(f"  UPDATE {rel}")
 
         # Bookkeeping for catalogues.
         parts = rel.split("/")

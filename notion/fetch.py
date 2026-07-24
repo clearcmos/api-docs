@@ -18,6 +18,7 @@ This fetcher:
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -35,7 +36,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 24
 
 
 def sha256(content: str) -> str:
@@ -43,10 +44,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "notion-api-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "notion-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -242,12 +249,6 @@ def sync(args: argparse.Namespace) -> None:
 
     for e in classified:
         raw = contents.get(e["url"])
-        if raw is None:
-            continue
-
-        content = build_page_markdown(raw, e)
-        content_hash = sha256(content)
-
         parts = [DOCS_DIR, e["group"]]
         if e["subgroup"]:
             parts.append(e["subgroup"])
@@ -257,6 +258,16 @@ def sync(args: argparse.Namespace) -> None:
         cache_key = f"{e['group']}:{e['subgroup']}:{e['slug']}"
         structure.setdefault(e["group"], {}).setdefault(e["subgroup"], []).append(e)
 
+        if raw is None:
+            if cache_key in cache and os.path.exists(file_path):
+                unchanged += 1
+                new_cache[cache_key] = cache[cache_key]
+            else:
+                structure[e["group"]][e["subgroup"]].pop()
+            continue
+
+        content = build_page_markdown(raw, e)
+        content_hash = sha256(content)
         if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(file_path):
             unchanged += 1
             new_cache[cache_key] = cache[cache_key]
@@ -273,6 +284,12 @@ def sync(args: argparse.Namespace) -> None:
             added += 1
         else:
             updated += 1
+
+    structure = {
+        group: {sub: items for sub, items in subs.items() if items}
+        for group, subs in structure.items()
+        if any(subs.values())
+    }
 
     # Per-subgroup READMEs
     for group, subs in structure.items():

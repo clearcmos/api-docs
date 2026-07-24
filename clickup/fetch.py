@@ -9,6 +9,7 @@ local markdown.
 """
 
 import argparse
+import gzip
 import hashlib
 import html.parser
 import json
@@ -40,6 +41,7 @@ GUIDES_DIR = os.path.join(DOCS_DIR, "guides")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 V2_SPEC_FILE = os.path.join(SCRIPT_DIR, "openapi-v2.json")
 V3_SPEC_FILE = os.path.join(SCRIPT_DIR, "openapi-v3.yaml")
+MAX_WORKERS = 16
 
 # Map docs slugs to guide categories.  Unknown slugs fall into "other".
 SLUG_CATEGORY = {
@@ -92,20 +94,32 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "clickup-api-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "clickup-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
 
 
 def fetch_bytes(url: str, timeout: int = 60) -> bytes | None:
-    req = Request(url, headers={"User-Agent": "clickup-api-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "clickup-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -1009,7 +1023,7 @@ def sync_guides(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple
 
     # Fetch all pages concurrently
     fetched: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(_fetch_doc_page, url): url for url in doc_urls}
         for future in as_completed(futures):
             url, html_content = future.result()

@@ -27,6 +27,7 @@ intentionally skipped).
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -53,6 +54,7 @@ RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
+SOURCE_CACHE_KEY = "__source__/tree"
 
 MAX_WORKERS = 12
 
@@ -62,14 +64,20 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    headers = {"User-Agent": "authelia-docs-fetcher/1.0"}
+    headers = {
+        "User-Agent": "authelia-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    }
     token = os.environ.get("GITHUB_TOKEN")
     if token and "api.github.com" in url:
         headers["Authorization"] = f"Bearer {token}"
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -840,8 +848,8 @@ class Converter:
 # Discovery and page model
 # ---------------------------------------------------------------------------
 
-def discover() -> list[str]:
-    """Return content-relative .md paths for the mirrored sections."""
+def discover() -> tuple[list[str], str]:
+    """Return content-relative paths and a hash of all relevant Git blobs."""
     print("Fetching repository tree...")
     body = fetch_url(TREE_URL, timeout=90)
     if not body:
@@ -852,15 +860,36 @@ def discover() -> list[str]:
         print("WARNING: tree response truncated; some files may be missing",
               file=sys.stderr)
     rels = []
+    manifest: list[tuple[str, str]] = []
+    data_paths = {
+        f"{DATA_PREFIX}{name}"
+        for name in ("misc.json", "configkeys.json", "languages.json",
+                     "support.json")
+    }
     for t in data.get("tree", []):
         p = t.get("path", "")
+        if t.get("type") == "blob" and p in data_paths:
+            manifest.append((p, t.get("sha", "")))
         if (t.get("type") != "blob" or not p.startswith(CONTENT_PREFIX)
                 or not p.endswith(".md")):
             continue
         rel = p[len(CONTENT_PREFIX):]
         if rel.split("/", 1)[0] in SECTIONS:
             rels.append(rel)
-    return sorted(rels)
+            manifest.append((p, t.get("sha", "")))
+    with open(__file__, "rb") as f:
+        fetcher_hash = hashlib.sha256(f.read()).hexdigest()
+    fingerprint = sha256(json.dumps({
+        "blobs": sorted(manifest),
+        "fetcher": fetcher_hash,
+    }, separators=(",", ":")))
+    return sorted(rels), fingerprint
+
+
+def source_outputs_complete(source: dict) -> bool:
+    outputs = source.get("outputs", [])
+    return bool(outputs) and all(
+        os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
 
 
 def hugo_urlize(title: str) -> str:
@@ -1032,15 +1061,33 @@ def sync(args: argparse.Namespace) -> None:
     old_cache = load_cache()
     cache = {} if args.force else old_cache
 
-    rels = discover()
+    rels, source_fingerprint = discover()
     print(f"  found {len(rels)} markdown files in scope")
+
+    previous_source = cache.get(SOURCE_CACHE_KEY, {})
+    if (not args.force
+            and previous_source.get("fingerprint") == source_fingerprint
+            and source_outputs_complete(previous_source)):
+        total_files = len(previous_source["outputs"])
+        print("  Source tree unchanged and all outputs present; "
+              "skipping content downloads and conversion")
+        print("\nSync complete:")
+        print("  Added:       0")
+        print("  Updated:     0")
+        print(f"  Unchanged:   {total_files}")
+        print("  Removed:     0")
+        print("  Unavailable: 0")
+        print(f"  Total pages: {previous_source.get('page_count', 0)}")
+        return
 
     print("Fetching data files...")
     data: dict = {}
+    missing_data: list[str] = []
     for name in ("misc.json", "configkeys.json", "languages.json", "support.json"):
         body = fetch_url(f"{RAW_BASE}/{DATA_PREFIX}{name}")
         if body is None:
             print(f"WARNING: missing data file {name}", file=sys.stderr)
+            missing_data.append(name)
             continue
         data[name.split(".")[0]] = json.loads(body)
 
@@ -1065,6 +1112,10 @@ def sync(args: argparse.Namespace) -> None:
         print(f"  unavailable: {len(missing)}")
         for rel in sorted(missing):
             print(f"    SKIP {rel}")
+    if missing or missing_data:
+        print("ERROR: source tree entries could not be fetched; leaving the "
+              "existing mirror untouched", file=sys.stderr)
+        sys.exit(1)
 
     pages: list[dict] = []
     drafts = 0
@@ -1097,9 +1148,11 @@ def sync(args: argparse.Namespace) -> None:
 
     added = updated = unchanged = 0
     new_cache: dict = {}
+    output_paths: set[str] = set()
 
     def emit(cache_key: str, file_path: str, content: str) -> None:
         nonlocal added, updated, unchanged
+        output_paths.add(os.path.relpath(file_path, DOCS_DIR))
         content_hash = sha256(content)
         prev = cache.get(cache_key, {})
         if prev.get("sha256") == content_hash and os.path.exists(file_path):
@@ -1136,10 +1189,19 @@ def sync(args: argparse.Namespace) -> None:
     emit("__readme__/_top", os.path.join(DOCS_DIR, "README.md"),
          build_top_readme(by_section, indexes))
 
+    new_cache[SOURCE_CACHE_KEY] = {
+        "fingerprint": source_fingerprint,
+        "outputs": sorted(output_paths),
+        "page_count": len(leaves),
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+
     # Removals
     removed = 0
     for old_key in sorted(old_cache):
         if old_key in new_cache:
+            continue
+        if old_key == SOURCE_CACHE_KEY:
             continue
         if old_key == "__readme__/_top":
             old_path = os.path.join(DOCS_DIR, "README.md")

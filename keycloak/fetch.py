@@ -25,6 +25,7 @@ All pages are converted from HTML to Markdown using stdlib html.parser.
 """
 
 import argparse
+import gzip
 import hashlib
 import html.parser
 import json
@@ -45,7 +46,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 24
 
 # URL path prefixes that belong to the /documentation scope.
 # Any sitemap URL whose path starts with one of these is included.
@@ -86,10 +87,15 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 120) -> str | None:
-    req = Request(url, headers={"User-Agent": "keycloak-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "keycloak-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
             return data.decode("utf-8", errors="replace")
     except HTTPError as e:
         if e.code == 404:
@@ -879,6 +885,7 @@ def sync(args: argparse.Namespace) -> None:
             "sha256": page_hash,
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "url": url,
+            "title": title,
         }
         if is_new:
             added += 1
@@ -916,11 +923,75 @@ def sync(args: argparse.Namespace) -> None:
             "sha256": page_hash,
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "url": url,
+            "title": title,
         }
         if is_new:
             added += 1
         else:
             updated += 1
+
+    # Preserve last known-good pages and catalogue entries after a transient
+    # fetch failure. A URL must disappear from discovery to be removed.
+    manual_by_url = {url: slug for slug, url in manual_jobs}
+    guide_url_set = set(guide_urls)
+    for url in missing:
+        if url in guide_url_set:
+            out_path = guide_path(url)
+            cache_key = os.path.relpath(out_path, DOCS_DIR)
+            prev = cache.get(cache_key, {})
+            if not prev or not os.path.exists(out_path):
+                continue
+            title = prev.get("title")
+            if not title:
+                try:
+                    with open(out_path, encoding="utf-8") as f:
+                        title = f.readline().strip().removeprefix("# ").strip()
+                except OSError:
+                    title = ""
+            title = title or urlparse(url).path.rstrip("/").split("/")[-1]
+            path_parts = urlparse(url).path.strip("/").split("/")
+            section = path_parts[0] if len(path_parts) > 1 else "_root"
+            rel_from_section = (
+                os.path.basename(out_path)
+                if section == "_root"
+                else os.path.relpath(out_path, os.path.join(DOCS_DIR, section))
+            )
+            sections.setdefault(section, []).append({
+                "title": title,
+                "rel": rel_from_section.replace(os.sep, "/"),
+                "url": url,
+            })
+            unchanged += 1
+            new_cache[cache_key] = {
+                **prev,
+                "title": title,
+                "url": url,
+            }
+            continue
+
+        slug = manual_by_url.get(url)
+        if slug is None:
+            continue
+        out_path = manual_path(slug)
+        cache_key = os.path.relpath(out_path, DOCS_DIR)
+        prev = cache.get(cache_key, {})
+        if not prev or not os.path.exists(out_path):
+            continue
+        title = prev.get("title")
+        if not title:
+            try:
+                with open(out_path, encoding="utf-8") as f:
+                    title = f.readline().strip().removeprefix("# ").strip()
+            except OSError:
+                title = ""
+        title = title or slug
+        manual_entries.append({"slug": slug, "title": title, "url": url})
+        unchanged += 1
+        new_cache[cache_key] = {
+            **prev,
+            "title": title,
+            "url": url,
+        }
 
     # --- Section READMEs -----------------------------------------------
     for section, pages in sections.items():

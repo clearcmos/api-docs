@@ -3,7 +3,7 @@
 """
 1Password Developer Documentation Fetcher
 
-Fetches all human-readable pages under https://developer.1password.com/docs/
+Fetches all human-readable pages under https://www.1password.dev/
 as markdown. Every doc page has a .md alternate served as text/markdown,
 so we discover URLs via sitemap.xml and llms.txt (union), then fetch each
 page directly.
@@ -15,6 +15,7 @@ exists, llms.txt supplies readable metadata.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -25,7 +26,7 @@ from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-SITE = "https://developer.1password.com"
+SITE = "https://www.1password.dev"
 SITEMAP_URL = f"{SITE}/sitemap.xml"
 LLMS_INDEX_URL = f"{SITE}/llms.txt"
 
@@ -33,7 +34,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 24
 
 
 def sha256(content: str) -> str:
@@ -41,10 +42,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "1password-api-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "1password-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -100,7 +107,7 @@ def parse_llms_index(text: str) -> tuple[list[tuple[str, str, str]], dict[str, s
     titles: dict[str, str] = {}
     section = ""
     link_re = re.compile(
-        r"^- \[([^\]]+)\]\((https://developer\.1password\.com/docs/[^)]+?)\.md\)"
+        rf"^- \[([^\]]+)\]\(({re.escape(SITE)}/[^)]+?)\.md\)"
     )
     for line in text.splitlines():
         if line.startswith("## "):
@@ -118,11 +125,13 @@ def parse_llms_index(text: str) -> tuple[list[tuple[str, str, str]], dict[str, s
 def normalize_docs_url(url: str) -> str | None:
     """Return canonical docs URL without trailing slash or .md suffix.
 
-    Returns None if the URL is not under /docs/.
+    Returns None if the URL is not a page on the canonical site.
     """
-    if not url.startswith(f"{SITE}/docs/"):
+    if not url.startswith(f"{SITE}/"):
         return None
     url = url.rstrip("/")
+    if url == SITE:
+        return None
     if url.endswith(".md"):
         url = url[:-3]
     return url
@@ -131,13 +140,11 @@ def normalize_docs_url(url: str) -> str | None:
 def path_for(url: str) -> tuple[str, str, str]:
     """Map a canonical docs URL to (category, subpath, file_path).
 
-    Single-segment URLs (e.g. /docs/cli) are category landing pages and
-    get stored as <category>/index.md so they live inside the category
-    directory alongside their children.
+    Single-segment URLs are category landing pages stored as `index.md`.
     """
-    rel = url[len(f"{SITE}/docs/"):]
+    rel = url[len(SITE) + 1:]
     parts = rel.split("/")
-    category = parts[0] if parts else "_root"
+    category = parts[0]
     subpath = rel
     if len(parts) == 1:
         file_path = os.path.join(DOCS_DIR, category, "index.md")
@@ -185,7 +192,7 @@ def build_category_readme(category: str, pages: list[dict]) -> str:
 
 def build_top_readme(categories: dict[str, list[dict]]) -> str:
     lines = ["# 1Password Developer Documentation", ""]
-    lines.append(f"*Mirrored from [{SITE}/docs/]({SITE}/docs/).*")
+    lines.append(f"*Mirrored from [{SITE}/]({SITE}/).*")
     lines.append("")
     lines.append("## Categories")
     lines.append("")
@@ -218,7 +225,23 @@ def discover_urls() -> tuple[list[str], dict[str, str]]:
     sitemap_urls = parse_sitemap(sitemap_xml)
     _, titles = parse_llms_index(llms_text)
 
-    llms_urls = list(titles.keys())
+    sitemap_canonical = {
+        canonical for u in sitemap_urls
+        if (canonical := normalize_docs_url(u)) is not None
+    }
+    # A few curated llms entries still use the former `/overview` URL while
+    # the sitemap exposes the section landing page at its parent path.
+    remapped_titles: dict[str, str] = {}
+    for url, title in titles.items():
+        canonical = normalize_docs_url(url)
+        if canonical and canonical not in sitemap_canonical:
+            parent = canonical.removesuffix("/overview")
+            if parent != canonical and parent in sitemap_canonical:
+                canonical = parent
+        if canonical:
+            remapped_titles[canonical] = title
+    titles = remapped_titles
+    llms_urls = list(titles)
     urls: set[str] = set()
     for u in sitemap_urls + llms_urls:
         canonical = normalize_docs_url(u)
@@ -270,15 +293,16 @@ def sync(args: argparse.Namespace) -> None:
     new_cache: dict = {}
     categories: dict[str, list[dict]] = {}
 
-    for url in sorted(fetched):
-        raw = fetched[url]
+    for url in sorted(urls):
         category, subpath, file_path = path_for(url)
-        title = titles.get(url)
-        if not title:
+        cache_key = subpath
+        prev = cache.get(cache_key, {})
+        raw = fetched.get(url)
+        title = titles.get(url) or prev.get("title")
+        if not title and raw is not None:
             m = re.match(r"^# (.+)$", raw, flags=re.MULTILINE)
             title = m.group(1).strip() if m else subpath
-        content = build_page_markdown(raw, titles.get(url), url)
-        content_hash = sha256(content)
+        title = title or subpath
 
         categories.setdefault(category, []).append({
             "subpath": subpath,
@@ -286,11 +310,27 @@ def sync(args: argparse.Namespace) -> None:
             "url": url,
         })
 
-        cache_key = subpath
-        prev = cache.get(cache_key, {})
+        if raw is None:
+            if prev and os.path.exists(file_path):
+                unchanged += 1
+                new_cache[cache_key] = {
+                    **prev,
+                    "title": title,
+                    "url": url,
+                }
+            else:
+                categories[category].pop()
+            continue
+
+        content = build_page_markdown(raw, titles.get(url), url)
+        content_hash = sha256(content)
         if prev.get("sha256") == content_hash and os.path.exists(file_path):
             unchanged += 1
-            new_cache[cache_key] = prev
+            new_cache[cache_key] = {
+                **prev,
+                "title": title,
+                "url": url,
+            }
             continue
 
         is_new = cache_key not in cache or not os.path.exists(file_path)
@@ -299,11 +339,15 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[cache_key] = {
             "sha256": content_hash,
             "last_updated": datetime.now(timezone.utc).isoformat(),
+            "title": title,
+            "url": url,
         }
         if is_new:
             added += 1
         else:
             updated += 1
+
+    categories = {name: pages for name, pages in categories.items() if pages}
 
     # Category READMEs
     for category, pages in categories.items():

@@ -19,6 +19,7 @@ All other deps are stdlib only.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -50,6 +51,7 @@ API_DOCS_DIR = os.path.join(DOCS_DIR, "api")
 SELF_HOSTING_DOCS_DIR = os.path.join(DOCS_DIR, "self-hosting")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 SPEC_FILE = os.path.join(SCRIPT_DIR, "openapi.yaml")
+MAX_WORKERS = 16
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +63,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "langfuse-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "langfuse-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -613,7 +621,7 @@ def sync_self_hosting(cache: dict, new_cache: dict, args: argparse.Namespace) ->
     fetched: dict[str, str] = {}
 
     print(f"  Fetching {len(all_files_to_fetch)} files from GitHub...")
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(_fetch_file, fp): fp for fp in all_files_to_fetch}
         for future in as_completed(futures):
             file_path, content = future.result()

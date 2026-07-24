@@ -8,6 +8,7 @@ from docs.immich.app, converting everything to local markdown.
 """
 
 import argparse
+import gzip
 import hashlib
 import html.parser
 import json
@@ -15,6 +16,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -30,6 +32,7 @@ API_DOCS_DIR = os.path.join(DOCS_DIR, "api")
 GENERAL_DOCS_DIR = os.path.join(DOCS_DIR, "general")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 SPEC_FILE = os.path.join(SCRIPT_DIR, "openapi.json")
+MAX_WORKERS = 16
 
 # Sections to include from general docs (URL path prefixes)
 GENERAL_SECTIONS = [
@@ -53,10 +56,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "immich-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "immich-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -966,9 +975,54 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
     added = 0
     updated = 0
     unchanged = 0
+    planned_cache_keys: set[str] = set()
+
+    for url in urls:
+        section, filename = url_to_filepath(url)
+        key = f"docs:{section}:{filename}" if section else f"docs::{filename}"
+        planned_cache_keys.add(key)
+        if section:
+            planned_cache_keys.add(f"docs:{section}:README")
+
+    print(f"Fetching general documentation (concurrency={MAX_WORKERS})...")
+    fetched_pages: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(fetch_url, url): url for url in urls}
+        for completed, future in enumerate(as_completed(futures), start=1):
+            url = futures[future]
+            content = future.result()
+            if content is not None:
+                fetched_pages[url] = content
+            if args.verbose or completed % 20 == 0:
+                print(f"  [{completed}/{len(urls)}] pages")
 
     # Track sections for building indexes
     sections: dict[str, list[tuple[str, str, str]]] = {}  # section -> [(filename, title, slug)]
+
+    def preserve_cached_page(
+        section: str, filename: str, url: str, cache_key: str, target_path: str
+    ) -> None:
+        """Keep a failed page and its index entry when a local copy exists."""
+        if cache_key not in cache:
+            return
+        entry = dict(cache[cache_key])
+        new_cache[cache_key] = entry
+        if not os.path.exists(target_path):
+            return
+        title = entry.get("title", "")
+        if not title:
+            try:
+                with open(target_path, "r") as f:
+                    first_line = f.readline().strip()
+                title = first_line.removeprefix("# ").strip()
+            except OSError:
+                title = ""
+        title = title or filename.replace(".md", "").replace("-", " ").title()
+        entry["title"] = title
+        entry["url"] = url
+        sections.setdefault(section, []).append(
+            (filename, title, filename.replace(".md", ""))
+        )
 
     for url in sorted(urls):
         section, filename = url_to_filepath(url)
@@ -981,15 +1035,18 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
 
         target_path = os.path.join(target_dir, filename)
 
-        # Fetch the page
-        page_html = fetch_url(url)
+        page_html = fetched_pages.get(url)
         if not page_html:
+            preserve_cached_page(
+                section, filename, url, cache_key, target_path)
             continue
 
         title, markdown = html_to_markdown(page_html)
         if not markdown.strip():
             if args.verbose:
                 print(f"  SKIP {section}/{filename} (empty content)")
+            preserve_cached_page(
+                section, filename, url, cache_key, target_path)
             continue
 
         # Clean title -- remove " | Immich" suffix
@@ -1004,7 +1061,11 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
 
         if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(target_path):
             unchanged += 1
-            new_cache[cache_key] = cache[cache_key]
+            new_cache[cache_key] = {
+                **cache[cache_key],
+                "title": title,
+                "url": url,
+            }
         else:
             is_new = cache_key not in cache or not os.path.exists(target_path)
             if args.dry_run:
@@ -1020,6 +1081,8 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
             new_cache[cache_key] = {
                 "sha256": content_hash,
                 "last_updated": datetime.now(timezone.utc).isoformat(),
+                "title": title,
+                "url": url,
             }
             if is_new:
                 added += 1
@@ -1084,6 +1147,9 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
     removed = 0
     for old_key in sorted(cache):
         if old_key.startswith("docs:") and old_key not in new_cache:
+            if old_key in planned_cache_keys:
+                new_cache[old_key] = cache[old_key]
+                continue
             parts = old_key.split(":", 2)
             if len(parts) == 3:
                 section = parts[1]

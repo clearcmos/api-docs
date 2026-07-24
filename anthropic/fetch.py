@@ -8,13 +8,14 @@ and converts them into organized local markdown files grouped by category.
 """
 
 import argparse
+import gzip
 import hashlib
 import html
 import json
 import os
 import re
 import sys
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -24,6 +25,7 @@ INDEX_URL = "https://code.claude.com/docs/llms.txt"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
+MAX_WORKERS = 30
 
 
 def sha256(content: str) -> str:
@@ -34,10 +36,14 @@ def fetch_url(url: str, timeout: int = 30) -> str | None:
     req = Request(url, headers={
         "User-Agent": "anthropic-docs-fetcher/1.0",
         "Accept": "text/html,text/plain,text/markdown,*/*",
+        "Accept-Encoding": "gzip",
     })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"  ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -248,7 +254,7 @@ def sync(args: argparse.Namespace) -> None:
     new_cache = {}
 
     total_pages = sum(len(pages) for pages in page_plan.values())
-    fetched = 0
+    work_items: list[tuple[str, dict]] = []
 
     for category in categories:
         pages = page_plan[category]
@@ -257,8 +263,19 @@ def sync(args: argparse.Namespace) -> None:
         if not args.dry_run:
             os.makedirs(cat_dir, exist_ok=True)
 
-        for page in pages:
-            fetched += 1
+        work_items.extend((category, page) for page in pages)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_item = {
+            executor.submit(
+                fetch_page_content, page["url"], args.verbose
+            ): (category, page)
+            for category, page in work_items
+        }
+
+        for fetched, future in enumerate(as_completed(future_to_item), start=1):
+            category, page = future_to_item[future]
+            cat_dir = os.path.join(DOCS_DIR, category)
             cache_key = f"{category}:{page['filename']}"
 
             # Check cache first -- if not force, we still need to fetch to
@@ -266,7 +283,7 @@ def sync(args: argparse.Namespace) -> None:
             if args.verbose or fetched % 10 == 0:
                 print(f"  [{fetched}/{total_pages}] {category}/{page['slug']}")
 
-            content = fetch_page_content(page["url"], verbose=args.verbose)
+            content = future.result()
             if content is None:
                 errors += 1
                 # Keep old cache entry if it exists
@@ -313,9 +330,6 @@ def sync(args: argparse.Namespace) -> None:
                 added_items.append(entry)
             else:
                 updated_items.append(entry)
-
-            # Small delay to be polite to the server
-            time.sleep(0.2)
 
     # For pages where we skipped fetching (cache hit), restore title from cache
     for category in categories:

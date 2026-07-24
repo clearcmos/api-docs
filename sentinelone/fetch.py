@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -51,13 +52,17 @@ def fetch_url(url: str, cookie_header: str | None = None, timeout: int = 60) -> 
     headers = {
         "User-Agent": "sentinelone-api-docs-fetcher/1.0",
         "Accept": "application/json",
+        "Accept-Encoding": "gzip",
     }
     if cookie_header:
         headers["Cookie"] = cookie_header
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None

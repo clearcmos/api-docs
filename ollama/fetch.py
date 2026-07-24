@@ -10,6 +10,7 @@ URL list and fetch each page directly.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -27,7 +28,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 24
 
 
 def sha256(content: str) -> str:
@@ -35,10 +36,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "ollama-api-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "ollama-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -256,11 +263,8 @@ def sync(args: argparse.Namespace) -> None:
     for entry in doc_entries:
         url = entry["url"]
         raw = fetched.get(url)
-        if raw is None:
-            continue
         category, slug, file_path = path_for_md(url)
-        content = build_page_markdown(raw, entry["title"], url)
-        content_hash = sha256(content)
+        cache_key = url[len(SITE) + 1:]  # path within docs.ollama.com
 
         categories.setdefault(category, []).append({
             "slug": slug if not (category == "" and slug == "index") else "index",
@@ -268,8 +272,17 @@ def sync(args: argparse.Namespace) -> None:
             "summary": entry["summary"],
         })
 
-        cache_key = url[len(SITE) + 1:]  # path within docs.ollama.com
         prev = cache.get(cache_key, {})
+        if raw is None:
+            if prev and os.path.exists(file_path):
+                unchanged += 1
+                new_cache[cache_key] = prev
+            else:
+                categories[category].pop()
+            continue
+
+        content = build_page_markdown(raw, entry["title"], url)
+        content_hash = sha256(content)
         if prev.get("sha256") == content_hash and os.path.exists(file_path):
             unchanged += 1
             new_cache[cache_key] = prev
@@ -286,6 +299,8 @@ def sync(args: argparse.Namespace) -> None:
             added += 1
         else:
             updated += 1
+
+    categories = {name: pages for name, pages in categories.items() if pages}
 
     # Category READMEs (skip top-level "" so we don't overwrite README.md)
     for category, pages in categories.items():

@@ -11,6 +11,7 @@ Requires: pyyaml (specs are YAML-only, no JSON alternative available)
 
 import argparse
 import concurrent.futures
+import gzip
 import hashlib
 import json
 import os
@@ -30,8 +31,10 @@ DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 INDEX_FILE = os.path.join(SCRIPT_DIR, "spec-index.json")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 16
+PARSE_WORKERS = min(12, os.cpu_count() or 1)
 USER_AGENT = "oracle-docs-fetcher/1.0"
+SOURCE_CACHE_PREFIX = "source:"
 
 
 # ---------------------------------------------------------------------------
@@ -43,10 +46,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> bytes | None:
-    req = Request(url, headers={"User-Agent": USER_AGENT})
+    req = Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"  ERROR: {url}: {e}", file=sys.stderr)
         return None
@@ -354,22 +363,98 @@ def fetch_spec_file(spec_path: str) -> bytes | None:
     return fetch_url(url, timeout=120)
 
 
-def download_specs(index: dict, verbose: bool) -> dict[str, tuple[str, dict]]:
+def spec_fingerprint(info: dict) -> str:
+    """Hash the output-relevant index metadata for one API."""
+    manifest = {
+        "specs": sorted(info.get("specs", [])),
+        "toc_title": info.get("toc_title", ""),
+    }
+    return sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+
+
+def cached_api_is_complete(api_key: str, info: dict, cache: dict) -> bool:
+    """Return whether an API's content-addressed specs and outputs are current."""
+    source = cache.get(f"{SOURCE_CACHE_PREFIX}{api_key}", {})
+    outputs = source.get("outputs", [])
+    return (
+        source.get("fingerprint") == spec_fingerprint(info)
+        and bool(outputs)
+        and all(os.path.isfile(os.path.join(DOCS_DIR, path))
+                for path in outputs)
+    )
+
+
+def carry_api_cache(api_key: str, cache: dict, new_cache: dict) -> None:
+    """Carry one untouched API's generated-file and source cache entries."""
+    prefixes = (f"api:{api_key}:", f"index:{api_key}:")
+    source_key = f"{SOURCE_CACHE_PREFIX}{api_key}"
+    for key, value in cache.items():
+        if key == source_key or key.startswith(prefixes):
+            new_cache[key] = value
+
+
+def cached_api_summary(
+    api_key: str, info: dict, cache: dict
+) -> tuple[str, str, int] | None:
+    """Recover catalogue metadata for an API kept after a fetch failure."""
+    source = cache.get(f"{SOURCE_CACHE_PREFIX}{api_key}", {})
+    endpoint_count = source.get("endpoint_count", 0)
+    if not endpoint_count:
+        readme_path = os.path.join(
+            DOCS_DIR, sanitize_filename(api_key), "README.md")
+        try:
+            with open(readme_path, "r") as f:
+                readme = f.read()
+            match = re.search(r"\*(\d+) endpoints total\*", readme)
+            if match:
+                endpoint_count = int(match.group(1))
+        except OSError:
+            pass
+    if not endpoint_count:
+        endpoint_count = sum(
+            key.startswith(f"api:{api_key}:") for key in cache)
+    if not endpoint_count:
+        return None
+    return (
+        sanitize_filename(api_key),
+        source.get("toc_title", info.get("toc_title", api_key)),
+        endpoint_count,
+    )
+
+
+def _parse_yaml_task(
+    task: tuple[str, str, str, bytes]
+) -> tuple[str, str, str, dict | None, str | None]:
+    api_key, toc_title, spec_path, data = task
+    try:
+        spec = yaml.safe_load(data)
+        if not isinstance(spec, dict):
+            return api_key, toc_title, spec_path, None, "not a mapping"
+        return api_key, toc_title, spec_path, spec, None
+    except yaml.YAMLError as e:
+        return api_key, toc_title, spec_path, None, str(e)
+
+
+def download_specs(
+    index: dict, verbose: bool, api_keys: set[str] | None = None
+) -> tuple[dict[str, tuple[str, dict]], set[str]]:
     """Download all spec files concurrently.
 
-    Returns {api_key: (toc_title, parsed_spec)}.
+    Returns ({api_key: (toc_title, parsed_spec)}, failed_api_keys).
     """
     # Build download tasks: [(api_key, toc_title, spec_url), ...]
     tasks = []
     for api_key, info in index.items():
+        if api_keys is not None and api_key not in api_keys:
+            continue
         toc_title = info.get("toc_title", api_key)
         for spec_path in info.get("specs", []):
             tasks.append((api_key, toc_title, spec_path))
 
     print(f"Downloading {len(tasks)} spec files with {MAX_WORKERS} workers...")
 
-    results: dict[str, tuple[str, dict]] = {}
-    errors = 0
+    downloaded: list[tuple[str, str, str, bytes]] = []
+    failed_apis: set[str] = set()
 
     def _download(task):
         api_key, toc_title, spec_path = task
@@ -383,44 +468,68 @@ def download_specs(index: dict, verbose: bool) -> dict[str, tuple[str, dict]]:
             done_count += 1
             api_key, toc_title, spec_path, data = future.result()
             if data is None:
-                errors += 1
+                failed_apis.add(api_key)
                 continue
-            try:
-                spec = yaml.safe_load(data)
-                if not isinstance(spec, dict):
-                    if verbose:
-                        print(f"  SKIP (not a dict): {api_key}")
-                    errors += 1
-                    continue
-                results[api_key] = (toc_title, spec)
-                if verbose:
-                    print(f"  [{done_count}/{len(tasks)}] {toc_title}")
-                elif done_count % 20 == 0:
-                    print(f"  ...{done_count}/{len(tasks)} downloaded")
-            except yaml.YAMLError as e:
-                print(f"  ERROR parsing {api_key}: {e}", file=sys.stderr)
-                errors += 1
+            downloaded.append((api_key, toc_title, spec_path, data))
+            if verbose:
+                print(f"  [{done_count}/{len(tasks)}] {toc_title}")
+            elif done_count % 20 == 0:
+                print(f"  ...{done_count}/{len(tasks)} downloaded")
 
-    print(f"Downloaded {len(results)} specs ({errors} errors)")
-    return results
+    print(f"Parsing {len(downloaded)} YAML specs with "
+          f"{PARSE_WORKERS} processes...")
+    if len(downloaded) < 3:
+        parsed = [_parse_yaml_task(task) for task in downloaded]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=PARSE_WORKERS
+        ) as pool:
+            parsed = list(pool.map(_parse_yaml_task, downloaded, chunksize=1))
+
+    candidates: dict[str, list[tuple[str, str, dict]]] = {}
+    for api_key, toc_title, spec_path, spec, error in parsed:
+        if error or spec is None:
+            print(f"  ERROR parsing {api_key} ({spec_path}): {error}",
+                  file=sys.stderr)
+            failed_apis.add(api_key)
+            continue
+        candidates.setdefault(api_key, []).append((toc_title, spec_path, spec))
+
+    results: dict[str, tuple[str, dict]] = {}
+    for api_key, versions in candidates.items():
+        if api_key in failed_apis:
+            continue
+        # A few API entries publish multiple dated versions. Select the
+        # newest deterministically instead of whichever thread finishes last.
+        toc_title, _, spec = max(
+            versions,
+            key=lambda item: str(item[2].get("info", {}).get("version", "")),
+        )
+        results[api_key] = (toc_title, spec)
+
+    print(f"Downloaded and parsed {len(results)} APIs "
+          f"({len(failed_apis)} errors)")
+    return results, failed_apis
 
 
 def process_spec(api_key: str, toc_title: str, spec: dict,
                  cache: dict, new_cache: dict, force: bool,
-                 dry_run: bool, verbose: bool) -> tuple[int, int, list[tuple[str, str]]]:
+                 dry_run: bool, verbose: bool
+                 ) -> tuple[int, int, list[tuple[str, str, int]], list[str]]:
     """Process a single API spec into markdown files.
 
-    Returns (written_count, skipped_count, [(filename, title), ...] for index).
+    Returns (written_count, skipped_count, index_entries, output_paths).
     """
     api_dir_name = sanitize_filename(api_key)
     api_dir = os.path.join(DOCS_DIR, api_dir_name)
     written = 0
     skipped = 0
+    output_paths: set[str] = set()
 
     # Determine OpenAPI version
     paths = spec.get("paths", {})
     if not paths:
-        return 0, 0, []
+        return 0, 0, [], []
 
     # Collect tag descriptions
     tag_descriptions = {}
@@ -469,6 +578,7 @@ def process_spec(api_key: str, toc_title: str, spec: dict,
                 tag_slug = sanitize_filename(tag)
                 tag_dir = os.path.join(api_dir, tag_slug) if tag_slug != api_dir_name else api_dir
                 full_path = os.path.join(tag_dir, filename)
+                output_paths.add(os.path.relpath(full_path, DOCS_DIR))
 
                 tag_endpoints.setdefault(tag, []).append({
                     "path": path,
@@ -508,6 +618,7 @@ def process_spec(api_key: str, toc_title: str, spec: dict,
 
         tag_dir = os.path.join(api_dir, tag_slug) if tag_slug != api_dir_name else api_dir
         readme_path = os.path.join(tag_dir, "README.md")
+        output_paths.add(os.path.relpath(readme_path, DOCS_DIR))
         index_entries.append((tag_slug, tag, len(endpoints)))
 
         if (not force and cache_key in cache
@@ -552,12 +663,14 @@ def process_spec(api_key: str, toc_title: str, spec: dict,
     api_readme_lines.append(f"\n*{total_endpoints} endpoints total*\n")
 
     api_readme = "\n".join(api_readme_lines)
+    api_readme_path = os.path.join(api_dir, "README.md")
+    output_paths.add(os.path.relpath(api_readme_path, DOCS_DIR))
     if not dry_run:
         os.makedirs(api_dir, exist_ok=True)
-        with open(os.path.join(api_dir, "README.md"), "w") as f:
+        with open(api_readme_path, "w") as f:
             f.write(api_readme)
 
-    return written, skipped, index_entries
+    return written, skipped, index_entries, sorted(output_paths)
 
 
 def write_top_readme(api_summaries: list[tuple[str, str, int]],
@@ -602,17 +715,38 @@ def main():
             json.dump(index, f, indent=2, sort_keys=True)
             f.write("\n")
 
-    # Download all specs concurrently
-    specs = download_specs(index, verbose=args.verbose)
+    # Spec paths in the index are content-addressed. Skip APIs whose manifest
+    # and generated outputs are still complete, avoiding both download and
+    # YAML parsing on routine incremental runs.
+    unchanged_apis = {
+        api_key for api_key, info in index.items()
+        if not args.force and cached_api_is_complete(api_key, info, cache)
+    }
+    changed_apis = set(index) - unchanged_apis
+    print(f"{len(unchanged_apis)} APIs unchanged; "
+          f"{len(changed_apis)} need fetching")
 
-    # Process each spec into markdown
+    # Download changed specs concurrently and parse the CPU-heavy YAML in
+    # separate processes.
+    specs, failed_apis = download_specs(
+        index, verbose=args.verbose, api_keys=changed_apis)
+    failed_apis |= changed_apis - set(specs)
+
+    # Process each changed spec into markdown.
     total_written = 0
     total_skipped = 0
-    api_summaries = []
+    api_summaries: dict[str, tuple[str, str, int]] = {}
+
+    for api_key in unchanged_apis:
+        carry_api_cache(api_key, cache, new_cache)
+        summary = cached_api_summary(api_key, index[api_key], cache)
+        if summary:
+            total_skipped += summary[2]
+            api_summaries[api_key] = summary
 
     print(f"Converting {len(specs)} specs to markdown...")
     for api_key, (toc_title, spec) in sorted(specs.items()):
-        written, skipped, index_entries = process_spec(
+        written, skipped, index_entries, outputs = process_spec(
             api_key, toc_title, spec, cache, new_cache,
             args.force, args.dry_run, args.verbose)
         total_written += written
@@ -621,13 +755,31 @@ def main():
         # Count total endpoints for this API
         total_ep = sum(c for _, _, c in index_entries)
         if total_ep > 0:
-            api_summaries.append((sanitize_filename(api_key), toc_title, total_ep))
+            api_summaries[api_key] = (
+                sanitize_filename(api_key), toc_title, total_ep)
+            new_cache[f"{SOURCE_CACHE_PREFIX}{api_key}"] = {
+                "fingerprint": spec_fingerprint(index[api_key]),
+                "toc_title": toc_title,
+                "endpoint_count": total_ep,
+                "outputs": outputs,
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+            }
 
         if args.verbose:
             print(f"  {toc_title}: {written} written, {skipped} cached")
 
+    # Preserve the last known-good cache and catalogue entry when a changed
+    # spec fails transiently. A later run will retry it because its source
+    # fingerprint remains old.
+    for api_key in failed_apis:
+        carry_api_cache(api_key, cache, new_cache)
+        summary = cached_api_summary(api_key, index[api_key], cache)
+        if summary:
+            total_skipped += summary[2]
+            api_summaries[api_key] = summary
+
     # Write top-level index
-    write_top_readme(api_summaries, args.dry_run)
+    write_top_readme(list(api_summaries.values()), args.dry_run)
 
     # Remove stale files
     removed = 0

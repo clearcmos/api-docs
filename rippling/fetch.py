@@ -17,19 +17,20 @@ The site is a Docusaurus app that bundles content in webpack chunks. This script
 
 import argparse
 import base64
+import gzip
 import hashlib
 import json
 import os
 import re
 import sys
-import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 BASE_URL = "https://developer.rippling.com"
-REQUEST_DELAY = 0.1  # seconds between requests
+MAX_WORKERS = 16
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
@@ -45,15 +46,19 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, description: str = "", timeout: int = 30) -> str | None:
-    """Fetch a URL with error handling and rate limiting."""
-    req = Request(url, headers={"User-Agent": "rippling-api-docs-fetcher/1.0"})
+    """Fetch a URL with error handling."""
+    req = Request(url, headers={
+        "User-Agent": "rippling-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         if description:
             print(f"  Fetching: {description}")
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read().decode("utf-8")
-        time.sleep(REQUEST_DELAY)
-        return data
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"  Error fetching {url}: {e}", file=sys.stderr)
         return None
@@ -765,6 +770,50 @@ def sync(args: argparse.Namespace) -> None:
         os.makedirs(DOCS_DIR, exist_ok=True)
 
     fail_count = 0
+    route_chunk_urls: dict[str, str] = {}
+
+    def preserve_cached_route(
+        category: str, filename: str, slug: str, cache_key: str,
+        entries: list[tuple[str, str, str]],
+    ) -> None:
+        """Keep a failed route and its catalogue entry when a local copy exists."""
+        filepath = os.path.join(DOCS_DIR, category, filename)
+        if cache_key not in cache or not os.path.exists(filepath):
+            return
+        entry = dict(cache[cache_key])
+        title = entry.get("title", "")
+        if not title:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    title = f.readline().strip().removeprefix("# ").strip()
+            except OSError:
+                title = ""
+        title = title or slug
+        description = entry.get("description", "")
+        entry["title"] = title
+        entry["description"] = description
+        new_cache[cache_key] = entry
+        entries.append((title, filename, description))
+
+    for route, info in webpack_info.items():
+        chunk_path = determine_content_chunk(info, chunk_url_map)
+        if chunk_path:
+            route_chunk_urls[route] = f"{BASE_URL}/{chunk_path}"
+
+    unique_chunk_urls = sorted(set(route_chunk_urls.values()))
+    print(f"\nFetching {len(unique_chunk_urls)} content chunks "
+          f"(concurrency={MAX_WORKERS})...")
+
+    chunk_contents: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(fetch_url, url): url for url in unique_chunk_urls}
+        for completed, future in enumerate(as_completed(futures), start=1):
+            url = futures[future]
+            content = future.result()
+            if content is not None:
+                chunk_contents[url] = content
+            if args.verbose or completed % 50 == 0:
+                print(f"  [{completed}/{len(unique_chunk_urls)}] chunks")
 
     for category in sorted(categories.keys()):
         cat_routes = sorted(categories[category])
@@ -781,23 +830,28 @@ def sync(args: argparse.Namespace) -> None:
             cache_key = f"cat:{category}:{filename}"
 
             # Get the content chunk URL
-            chunk_path = determine_content_chunk(info, chunk_url_map)
-            if not chunk_path:
+            chunk_url = route_chunk_urls.get(route)
+            if not chunk_url:
                 print(f"  SKIP (no chunk): {slug}")
                 fail_count += 1
+                preserve_cached_route(
+                    category, filename, slug, cache_key, cat_readme_entries)
                 continue
 
-            chunk_url = f"{BASE_URL}/{chunk_path}"
-            chunk_js = fetch_url(chunk_url)
+            chunk_js = chunk_contents.get(chunk_url)
             if not chunk_js:
                 print(f"  FAIL: {slug}")
                 fail_count += 1
+                preserve_cached_route(
+                    category, filename, slug, cache_key, cat_readme_entries)
                 continue
 
             # Check if this is a JS chunk or an HTML fallback (404-like)
             if chunk_js.startswith('<!doctype') or chunk_js.startswith('<html'):
                 print(f"  SKIP (HTML response): {slug}")
                 fail_count += 1
+                preserve_cached_route(
+                    category, filename, slug, cache_key, cat_readme_entries)
                 continue
 
             # Extract frontmatter
@@ -812,6 +866,8 @@ def sync(args: argparse.Namespace) -> None:
                 else:
                     print(f"  FAIL (no API spec): {slug}")
                     fail_count += 1
+                    preserve_cached_route(
+                        category, filename, slug, cache_key, cat_readme_entries)
                     continue
             else:
                 markdown = build_guide_markdown(chunk_js, frontmatter)
@@ -822,6 +878,12 @@ def sync(args: argparse.Namespace) -> None:
 
             write_file(filepath, markdown, cache_key, cache, new_cache,
                        counters, args, f"{category}/{filename}")
+            if cache_key in new_cache:
+                new_cache[cache_key] = {
+                    **new_cache[cache_key],
+                    "title": display_title,
+                    "description": frontmatter.get('description', ''),
+                }
 
         # Write category README
         readme_content = build_category_readme(category, cat_readme_entries)

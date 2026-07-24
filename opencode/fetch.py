@@ -24,6 +24,7 @@ plist/XML/keybind examples that look like tags survive verbatim.
 """
 
 import argparse
+import gzip
 import hashlib
 import html
 import json
@@ -43,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 24
 USER_AGENT = "opencode-api-docs-fetcher/1.0"
 
 
@@ -52,10 +53,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": USER_AGENT})
+    req = Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -438,15 +445,20 @@ def sync(args: argparse.Namespace) -> None:
     for entry in entries:
         slug = entry["slug"]
         raw = fetched.get(slug)
-        if raw is None:
-            continue
-        present.append(entry)
-        content = build_page_markdown(raw, entry["title"], page_url(slug))
-        content_hash = sha256(content)
         key = cache_key(slug)
         path = file_path(slug)
 
         prev = cache.get(key, {})
+        if raw is None:
+            if prev and os.path.exists(path):
+                unchanged += 1
+                new_cache[key] = prev
+                present.append(entry)
+            continue
+
+        present.append(entry)
+        content = build_page_markdown(raw, entry["title"], page_url(slug))
+        content_hash = sha256(content)
         if prev.get("sha256") == content_hash and os.path.exists(path):
             unchanged += 1
             new_cache[key] = prev

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -25,10 +26,16 @@ def sha256(content: str) -> str:
 
 def fetch_url(url: str, timeout: int = 30) -> str | None:
     """Fetch URL content. Returns None on failure."""
-    req = Request(url, headers={"User-Agent": "sync-google-api-docs/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "sync-google-api-docs/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         return None
 
@@ -136,46 +143,45 @@ def sync(args: argparse.Namespace) -> None:
     selected = select_apis(items)
     print(f"  Selected {len(selected)} APIs to sync")
 
-    # Build reverse map: filename -> api_id from cache
-    cached_files: dict[str, str] = {}
-    for api_id in cache:
-        cached_files[api_id_to_filename(api_id)] = api_id
-
-    # Fetch all discovery docs in parallel
+    # Fetch all discovery docs in parallel. Most service-hosted discovery
+    # endpoints expose neither validators nor partial-response support.
     print("Fetching discovery documents...")
     results: dict[str, tuple[str | None, dict]] = {}
-    skipped = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
-            pool.submit(fetch_discovery_doc, item, args.verbose): api_id
-            for api_id, item in selected.items()
+            pool.submit(fetch_discovery_doc, item, args.verbose): item["id"]
+            for item in selected.values()
         }
         for future in as_completed(futures):
             api_id, content, item = future.result()
-            if content is None:
-                skipped += 1
             results[api_id] = (content, item)
 
     # Process results
     added = 0
     updated = 0
     unchanged = 0
-    failed = skipped
+    failed = 0
     new_cache = {}
 
-    for api_id in sorted(results):
-        content, item = results[api_id]
-        if content is None:
-            continue
-
+    for api_id, item in sorted(selected.items()):
+        cached = cache.get(api_id, {})
         filename = api_id_to_filename(api_id)
         filepath = os.path.join(DOCS_DIR, filename)
+
+        content, _ = results.get(api_id, (None, item))
+        if content is None:
+            failed += 1
+            # Preserve a last known-good result after a transient fetch
+            # failure instead of losing its cache entry.
+            if cached and os.path.exists(filepath):
+                new_cache[api_id] = cached
+            continue
+
         content_hash = sha256(content)
         revision = json.loads(content).get("revision", "")
 
         # Check cache
-        cached = cache.get(api_id, {})
         if cached.get("sha256") == content_hash and os.path.exists(filepath):
             unchanged += 1
             new_cache[api_id] = cached
@@ -210,7 +216,7 @@ def sync(args: argparse.Namespace) -> None:
 
     # Detect removals: cached APIs no longer in directory
     deprecated = 0
-    current_ids = set(results.keys())
+    current_ids = set(selected)
     for old_id in sorted(cache):
         if old_id not in current_ids:
             filename = api_id_to_filename(old_id)
@@ -226,9 +232,7 @@ def sync(args: argparse.Namespace) -> None:
                 deprecated += 1
 
     # Write index
-    index_content = build_index(
-        {k: v for k, (content, v) in results.items() if content is not None}
-    )
+    index_content = build_index(selected)
     if not args.dry_run:
         with open(INDEX_FILE, "w") as f:
             f.write(index_content)

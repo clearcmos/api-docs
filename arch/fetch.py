@@ -34,6 +34,7 @@ API:    https://wiki.archlinux.org/api.php
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -41,6 +42,7 @@ import re
 import sys
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -57,6 +59,7 @@ USER_AGENT = "arch-wiki-docs-fetcher/1.0"
 # Per-batch limits used by the public MediaWiki API for non-bot accounts.
 BATCH_SIZE = 50
 LIST_LIMIT = 500
+MAX_BATCH_WORKERS = 2
 
 # Languages used as suffixes on translated Arch Wiki articles. A title
 # ending with " (X)" where X is one of these is treated as non-English and
@@ -101,12 +104,16 @@ def http_get_json(url: str, timeout: int = 60, retries: int = 3) -> dict | None:
     req = Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
+        "Accept-Encoding": "gzip",
     })
     last_err: Exception | None = None
     for attempt in range(retries):
         try:
             with urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                data = resp.read()
+                if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                    data = gzip.decompress(data)
+                return json.loads(data.decode("utf-8"))
         except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
             last_err = e
             if attempt < retries - 1:
@@ -232,21 +239,60 @@ def discover_titles(verbose: bool = False) -> list[str]:
     return titles
 
 
-def fetch_pages_bulk(titles: list[str], verbose: bool = False) -> dict[str, dict]:
+def discover_revisions(verbose: bool = False) -> dict[str, int]:
+    """Discover English article titles and current revision IDs together."""
+    revisions: dict[str, int] = {}
+    cont: dict | None = None
+    page_no = 0
+    while True:
+        params: dict[str, str | int] = {
+            "action": "query",
+            "generator": "allpages",
+            "gapnamespace": "0",
+            "gapfilterredir": "nonredirects",
+            "gaplimit": LIST_LIMIT,
+            "prop": "revisions",
+            "rvprop": "ids",
+            "format": "json",
+            "formatversion": "2",
+        }
+        if cont:
+            params.update(cont)
+        url = f"{API}?{urllib.parse.urlencode(params)}"
+        data = http_get_json(url)
+        if data is None:
+            raise RuntimeError("article revision discovery failed")
+        for page in data.get("query", {}).get("pages", []):
+            title = page.get("title", "")
+            if not title or is_translated_title(title):
+                continue
+            page_revisions = page.get("revisions") or []
+            revision = page_revisions[0].get("revid", 0) if page_revisions else 0
+            revisions[title] = int(revision or 0)
+        page_no += 1
+        if verbose:
+            print(f"  revision page {page_no}: {len(revisions)} English titles")
+        cont = data.get("continue")
+        if not cont:
+            break
+        cont = {k: v for k, v in cont.items() if k != "continue"}
+    return dict(sorted(revisions.items(), key=lambda item: item[0].lower()))
+
+
+def fetch_pages_bulk(
+    titles: list[str], verbose: bool = False
+) -> tuple[dict[str, dict], int]:
     """Fetch wikitext + categories for all titles via batched API calls.
 
-    Returns {title: {"wikitext": str, "categories": [str, ...]}}. Categories
-    are returned without their `Category:` prefix. Missing/unavailable pages
-    are silently skipped.
+    Returns ({title: {"wikitext": str, "categories": [str, ...]}},
+    failed_batch_count). Categories are returned without their `Category:`
+    prefix. Missing/unavailable pages are silently skipped.
 
     A single API call returns both content and categories via
     `prop=revisions|categories`. Categories may paginate beyond cllimit when
     a batch has many; the continuation is followed transparently.
     """
-    out: dict[str, dict] = {}
-    total_batches = (len(titles) + BATCH_SIZE - 1) // BATCH_SIZE
-    for batch_idx in range(0, len(titles), BATCH_SIZE):
-        batch = titles[batch_idx:batch_idx + BATCH_SIZE]
+    def fetch_batch(batch: list[str]) -> tuple[dict[str, dict], bool]:
         merged: dict[str, dict] = {}
         cont: dict | None = None
         while True:
@@ -266,7 +312,7 @@ def fetch_pages_bulk(titles: list[str], verbose: bool = False) -> dict[str, dict
             url = f"{API}?{urllib.parse.urlencode(params)}"
             data = http_get_json(url)
             if data is None:
-                break
+                return merged, False
             pages = data.get("query", {}).get("pages", [])
             if isinstance(pages, dict):
                 pages = list(pages.values())
@@ -274,7 +320,8 @@ def fetch_pages_bulk(titles: list[str], verbose: bool = False) -> dict[str, dict
                 title = p.get("title")
                 if not title:
                     continue
-                entry = merged.setdefault(title, {"wikitext": None, "categories": []})
+                entry = merged.setdefault(
+                    title, {"wikitext": None, "categories": []})
                 revs = p.get("revisions") or []
                 if revs and entry["wikitext"] is None:
                     slot = revs[0].get("slots", {}).get("main", {})
@@ -289,17 +336,30 @@ def fetch_pages_bulk(titles: list[str], verbose: bool = False) -> dict[str, dict
                         entry["categories"].append(name)
             cont = data.get("continue")
             if not cont:
-                break
+                return merged, True
             # Drop the inner-only `continue` marker; keep the real cursors.
             cont = {k: v for k, v in cont.items() if k != "continue"}
-        for t, e in merged.items():
-            if e["wikitext"] is not None:
-                out[t] = e
-        if verbose:
-            done = batch_idx // BATCH_SIZE + 1
-            print(f"  batch {done}/{total_batches}: {len(out)} pages so far")
-        time.sleep(0.3)
-    return out
+
+    out: dict[str, dict] = {}
+    total_batches = (len(titles) + BATCH_SIZE - 1) // BATCH_SIZE
+    batches = [
+        titles[i:i + BATCH_SIZE]
+        for i in range(0, len(titles), BATCH_SIZE)
+    ]
+    failed_batches = 0
+    with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKERS) as pool:
+        futures = {pool.submit(fetch_batch, batch): batch for batch in batches}
+        for done, future in enumerate(as_completed(futures), start=1):
+            merged, succeeded = future.result()
+            if not succeeded:
+                failed_batches += 1
+            for title, entry in merged.items():
+                if entry["wikitext"] is not None:
+                    out[title] = entry
+            if verbose:
+                print(f"  batch {done}/{total_batches}: "
+                      f"{len(out)} pages so far")
+    return out, failed_batches
 
 
 # ---------------------------------------------------------------------------
@@ -1013,17 +1073,45 @@ def sync(args: argparse.Namespace) -> None:
     cache: dict = {} if args.force else load_cache()
     new_cache: dict = {}
 
-    print("Discovering English articles...")
-    titles = discover_titles(verbose=args.verbose)
+    print("Discovering English articles and revision IDs...")
+    try:
+        revisions = discover_revisions(verbose=args.verbose)
+    except RuntimeError as e:
+        print(f"ERROR: {e}; leaving the existing mirror untouched",
+              file=sys.stderr)
+        sys.exit(1)
+    titles = list(revisions)
     print(f"  {len(titles)} English articles found")
 
     if args.limit:
         titles = titles[:args.limit]
+        revisions = {title: revisions[title] for title in titles}
         print(f"  --limit applied: trimmed to {len(titles)}")
 
-    print(f"\nFetching wikitext (batches of {BATCH_SIZE})...")
-    pages = fetch_pages_bulk(titles, verbose=args.verbose)
-    print(f"  fetched {len(pages)} pages")
+    titles_to_fetch = []
+    for title in titles:
+        rel = title_to_filename(title)
+        previous = cache.get(rel, {})
+        if (
+            not args.force
+            and previous.get("revision") == revisions[title]
+            and isinstance(previous.get("categories"), list)
+            and os.path.exists(os.path.join(DOCS_DIR, rel))
+        ):
+            continue
+        titles_to_fetch.append(title)
+
+    print(f"  {len(titles) - len(titles_to_fetch)} revisions unchanged; "
+          f"{len(titles_to_fetch)} need content")
+    print(f"\nFetching changed wikitext (batches of {BATCH_SIZE}, "
+          f"concurrency={MAX_BATCH_WORKERS})...")
+    pages, failed_batches = fetch_pages_bulk(
+        titles_to_fetch, verbose=args.verbose)
+    if failed_batches:
+        print(f"ERROR: {failed_batches} page batches failed after retries; "
+              "leaving the existing mirror untouched", file=sys.stderr)
+        sys.exit(1)
+    print(f"  fetched {len(pages)} changed pages")
 
     if not args.dry_run:
         os.makedirs(DOCS_DIR, exist_ok=True)
@@ -1035,14 +1123,17 @@ def sync(args: argparse.Namespace) -> None:
     errors = 0
     category_members: dict[str, list[str]] = {}
 
-    def commit(rel: str, content: str, label_for_log: str) -> None:
+    def commit(
+        rel: str, content: str, label_for_log: str,
+        metadata: dict | None = None,
+    ) -> None:
         nonlocal unchanged
         out_path = os.path.join(DOCS_DIR, rel)
         digest = sha256(content)
         prev = cache.get(rel, {})
         if prev.get("sha256") == digest and os.path.exists(out_path):
             unchanged += 1
-            new_cache[rel] = prev
+            new_cache[rel] = {**prev, **(metadata or {})}
             return
         is_new = rel not in cache or not os.path.exists(out_path)
         write_file(out_path, content, dry_run=args.dry_run, verbose=args.verbose,
@@ -1051,6 +1142,7 @@ def sync(args: argparse.Namespace) -> None:
             "sha256": digest,
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "title": label_for_log,
+            **(metadata or {}),
         }
         entry = f"{label_for_log} ({rel})"
         (added if is_new else updated).append(entry)
@@ -1058,14 +1150,40 @@ def sync(args: argparse.Namespace) -> None:
     # --- Articles ------------------------------------------------------
     for idx, title in enumerate(titles, start=1):
         page = pages.get(title)
-        if page is None or page.get("wikitext") is None:
-            errors += 1
-            continue
-        body_md = wikitext_to_markdown(page["wikitext"])
-        cats = page.get("categories", []) or []
-        page_md = build_page_markdown(title, body_md, cats)
         rel = title_to_filename(title)
-        commit(rel, page_md, title)
+        if page is None:
+            previous = cache.get(rel, {})
+            cats = previous.get("categories", [])
+            if (
+                previous.get("revision") == revisions[title]
+                and isinstance(cats, list)
+                and os.path.exists(os.path.join(DOCS_DIR, rel))
+            ):
+                unchanged += 1
+                new_cache[rel] = previous
+            else:
+                errors += 1
+                if previous and os.path.exists(os.path.join(DOCS_DIR, rel)):
+                    new_cache[rel] = previous
+                    cats = previous.get("categories", [])
+                else:
+                    continue
+        elif page.get("wikitext") is None:
+            errors += 1
+            previous = cache.get(rel, {})
+            if previous and os.path.exists(os.path.join(DOCS_DIR, rel)):
+                new_cache[rel] = previous
+                cats = previous.get("categories", [])
+            else:
+                continue
+        else:
+            body_md = wikitext_to_markdown(page["wikitext"])
+            cats = page.get("categories", []) or []
+            page_md = build_page_markdown(title, body_md, cats)
+            commit(rel, page_md, title, {
+                "revision": revisions[title],
+                "categories": cats,
+            })
 
         for c in cats:
             if is_tracking_category(c):

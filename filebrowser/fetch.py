@@ -18,6 +18,7 @@ admonitions already use GitHub-style > [!NOTE] callouts.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -50,6 +51,7 @@ ROOT_PAGES = {
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
+SOURCE_CACHE_KEY = "__source__/tree"
 
 MAX_WORKERS = 8
 
@@ -59,14 +61,20 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    headers = {"User-Agent": "filebrowser-docs-fetcher/1.0"}
+    headers = {
+        "User-Agent": "filebrowser-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    }
     token = os.environ.get("GITHUB_TOKEN")
     if token and "api.github.com" in url:
         headers["Authorization"] = f"Bearer {token}"
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -106,8 +114,8 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # Discovery
 # ---------------------------------------------------------------------------
 
-def discover_pages() -> dict[str, str]:
-    """Return {site-relative page path: repo path} for every doc page."""
+def discover_pages() -> tuple[dict[str, str], str]:
+    """Return page paths and a hash of their Git blobs plus mkdocs.yml."""
     print("Fetching repository tree...")
     body = fetch_url(TREE_URL, timeout=90)
     if not body:
@@ -118,15 +126,32 @@ def discover_pages() -> dict[str, str]:
         print("WARNING: tree response truncated; some files may be missing",
               file=sys.stderr)
     pages: dict[str, str] = {}
+    blob_shas: dict[str, str] = {}
     for t in data.get("tree", []):
         path = t.get("path", "")
+        if t.get("type") == "blob":
+            blob_shas[path] = t.get("sha", "")
         if (t.get("type") == "blob"
                 and path.startswith(DOCS_PREFIX)
                 and path.endswith(".md")):
             pages[path[len(DOCS_PREFIX):]] = path
     for rel, repo_path in ROOT_PAGES.items():
         pages[rel] = repo_path
-    return pages
+    relevant = set(pages.values()) | {"www/mkdocs.yml"}
+    with open(__file__, "rb") as f:
+        fetcher_hash = hashlib.sha256(f.read()).hexdigest()
+    fingerprint = sha256(json.dumps({
+        "blobs": sorted((path, blob_shas.get(path, ""))
+                        for path in relevant),
+        "fetcher": fetcher_hash,
+    }, separators=(",", ":")))
+    return pages, fingerprint
+
+
+def source_outputs_complete(source: dict) -> bool:
+    outputs = source.get("outputs", [])
+    return bool(outputs) and all(
+        os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
 
 
 # ---------------------------------------------------------------------------
@@ -374,12 +399,32 @@ def sync(args: argparse.Namespace) -> None:
     old_cache = load_cache()
     cache = {} if args.force else old_cache
 
-    pages = discover_pages()
+    pages, source_fingerprint = discover_pages()
     print(f"  found {len(pages)} pages ({len(pages) - len(ROOT_PAGES)} in "
           f"{DOCS_PREFIX}, {len(ROOT_PAGES)} repo-root)")
 
+    previous_source = cache.get(SOURCE_CACHE_KEY, {})
+    if (not args.force
+            and previous_source.get("fingerprint") == source_fingerprint
+            and source_outputs_complete(previous_source)):
+        total_files = len(previous_source["outputs"])
+        print("  Source tree unchanged and all outputs present; "
+              "skipping content downloads and conversion")
+        print("\nSync complete:")
+        print("  Added:       0")
+        print("  Updated:     0")
+        print(f"  Unchanged:   {total_files}")
+        print("  Removed:     0")
+        print("  Unavailable: 0")
+        print(f"  Total pages: {previous_source.get('page_count', 0)}")
+        return
+
     print("Fetching mkdocs.yml...")
     mkdocs_yml = fetch_url(MKDOCS_URL)
+    if mkdocs_yml is None:
+        print("ERROR: failed to fetch mkdocs.yml; leaving the existing "
+              "mirror untouched", file=sys.stderr)
+        sys.exit(1)
     nav = parse_nav(mkdocs_yml) if mkdocs_yml else []
     if not nav:
         print("WARNING: could not parse mkdocs nav; indexes will be flat",
@@ -418,6 +463,9 @@ def sync(args: argparse.Namespace) -> None:
         print(f"  unavailable: {len(missing)}")
         for rel in sorted(missing):
             print(f"    SKIP {rel}")
+        print("ERROR: source tree entries could not be fetched; leaving the "
+              "existing mirror untouched", file=sys.stderr)
+        sys.exit(1)
 
     page_set = set(fetched)
     build_page.page_set = page_set
@@ -428,9 +476,11 @@ def sync(args: argparse.Namespace) -> None:
     added = updated = unchanged = 0
     new_cache: dict = {}
     titles: dict[str, str] = {}
+    output_paths: set[str] = set()
 
     def emit(cache_key: str, file_path: str, content: str) -> None:
         nonlocal added, updated, unchanged
+        output_paths.add(os.path.relpath(file_path, DOCS_DIR))
         content_hash = sha256(content)
         prev = cache.get(cache_key, {})
         if prev.get("sha256") == content_hash and os.path.exists(file_path):
@@ -460,10 +510,19 @@ def sync(args: argparse.Namespace) -> None:
     emit("__readme__/cli", os.path.join(DOCS_DIR, "cli", "README.md"),
          build_cli_readme(nav_pages(nav), titles, page_set))
 
+    new_cache[SOURCE_CACHE_KEY] = {
+        "fingerprint": source_fingerprint,
+        "outputs": sorted(output_paths),
+        "page_count": len(fetched),
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+
     # Removals
     removed = 0
     for old_key in sorted(old_cache):
         if old_key in new_cache:
+            continue
+        if old_key == SOURCE_CACHE_KEY:
             continue
         if old_key == "__readme__/_top":
             old_path = os.path.join(DOCS_DIR, "README.md")

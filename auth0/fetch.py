@@ -15,6 +15,7 @@ Covers four APIs:
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -49,10 +50,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 120) -> str | None:
-    req = Request(url, headers={"User-Agent": "auth0-api-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "auth0-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None

@@ -14,6 +14,7 @@ This is the runtime remote-control protocol, distinct from the sibling `obs/` fe
 which mirrors the libobs C plugin/scripting API.
 """
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -42,10 +43,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": USER_AGENT})
+    req = Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         print(f"ERROR: {url}: HTTP {e.code}", file=sys.stderr)
         return None

@@ -23,6 +23,7 @@ Examples:
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -46,6 +47,7 @@ INDEX_FILE = os.path.join(SCRIPT_DIR, "provider-index.json")
 PROVIDER_DOCS_FILE = os.path.join(SCRIPT_DIR, "provider-docs.json")
 
 INDEX_MAX_AGE_HOURS = 24
+MAX_WORKERS = 16
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +59,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "terraform-api-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "terraform-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -93,6 +101,52 @@ def strip_frontmatter(content: str) -> str:
     if len(parts) >= 3:
         return parts[2].strip()
     return content
+
+
+def docs_manifest_hash(docs: list[dict]) -> str:
+    """Hash the immutable Registry document IDs and output-relevant metadata."""
+    manifest = [
+        {
+            "id": str(doc.get("id", "")),
+            "category": doc.get("category", "other"),
+            "slug": doc.get("slug", ""),
+            "title": doc.get("title", ""),
+        }
+        for doc in docs
+    ]
+    manifest.sort(key=lambda item: (
+        item["category"], item["slug"], item["id"], item["title"]
+    ))
+    return sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+
+
+def load_provider_docs_snapshot() -> dict:
+    if not os.path.exists(PROVIDER_DOCS_FILE):
+        return {}
+    try:
+        with open(PROVIDER_DOCS_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def cache_is_complete(docs: list[dict], cache: dict) -> bool:
+    expected: set[tuple[str, str]] = set()
+    categories: set[str] = set()
+    for doc in docs:
+        category = sanitize_filename(doc.get("category", "other"))
+        slug = doc.get("slug", doc.get("title", "untitled"))
+        filename = f"{sanitize_filename(slug)}.md"
+        expected.add((f"{category}:{filename}",
+                      os.path.join(DOCS_DIR, category, filename)))
+        categories.add(category)
+    for category in categories:
+        expected.add((f"{category}:README.md",
+                      os.path.join(DOCS_DIR, category, "README.md")))
+    return (
+        os.path.exists(os.path.join(DOCS_DIR, "README.md"))
+        and all(key in cache and os.path.exists(path) for key, path in expected)
+    )
 
 
 def fetch_doc_content(doc_id: str) -> dict | None:
@@ -314,6 +368,7 @@ def build_top_readme(provider: str, version: str, categories: dict[str, list[dic
 def sync(args: argparse.Namespace) -> None:
     provider = args.provider
     cache = {} if args.force else load_cache()
+    previous_snapshot = load_provider_docs_snapshot()
 
     v1_url = f"{REGISTRY_V1}/{provider}"
 
@@ -338,10 +393,33 @@ def sync(args: argparse.Namespace) -> None:
     docs = version_data.get("docs", [])
     print(f"  Found {len(docs)} documentation pages")
 
-    if not args.dry_run:
-        with open(PROVIDER_DOCS_FILE, "w") as f:
-            json.dump(version_data, f, indent=2)
-            f.write("\n")
+    snapshot_provider = (
+        f"{previous_snapshot.get('namespace', '')}/"
+        f"{previous_snapshot.get('name', '')}"
+    ).strip("/")
+    same_manifest = (
+        not args.force
+        and snapshot_provider == provider
+        and previous_snapshot.get("version") == latest_version
+        and docs_manifest_hash(previous_snapshot.get("docs", []))
+            == docs_manifest_hash(docs)
+    )
+    if same_manifest and cache_is_complete(docs, cache):
+        category_count = len({
+            sanitize_filename(doc.get("category", "other")) for doc in docs
+        })
+        file_count = len(cache)
+        print("  Manifest unchanged and local cache complete; "
+              "skipping individual document downloads")
+        print("\nSync complete:")
+        print("  Added:        0")
+        print("  Updated:      0")
+        print(f"  Unchanged:    {file_count}")
+        print("  Removed:      0")
+        print(f"  Total files:  {file_count}")
+        print(f"  Total categories: {category_count}")
+        print(f"  Total docs:   {len(docs)}")
+        return
 
     # Organize docs by category
     categories: dict[str, list[dict]] = {}
@@ -360,7 +438,7 @@ def sync(args: argparse.Namespace) -> None:
         attrs = fetch_doc_content(doc_id)
         return doc_id, attrs
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(_fetch_one, doc): doc for doc in docs}
         for future in as_completed(futures):
             doc_id, attrs = future.result()
@@ -395,23 +473,35 @@ def sync(args: argparse.Namespace) -> None:
             title = doc.get("title", doc.get("slug", "untitled"))
             slug = doc.get("slug", title)
             filename = f"{sanitize_filename(slug)}.md"
+            cache_key = f"{safe_category}:{filename}"
+            file_path = os.path.join(category_dir, filename)
 
             attrs = doc_contents.get(doc_id)
             if not attrs:
+                if cache_key in cache and os.path.exists(file_path):
+                    new_cache[cache_key] = cache[cache_key]
+                    category_docs.setdefault(safe_category, []).append({
+                        "title": title,
+                        "filename": filename,
+                    })
                 continue
 
             content = strip_frontmatter(attrs.get("content", ""))
             if not content:
+                if cache_key in cache and os.path.exists(file_path):
+                    new_cache[cache_key] = cache[cache_key]
+                    category_docs.setdefault(safe_category, []).append({
+                        "title": title,
+                        "filename": filename,
+                    })
                 continue
-
-            content_hash = sha256(content)
-            cache_key = f"{safe_category}:{filename}"
-            file_path = os.path.join(category_dir, filename)
 
             category_docs.setdefault(safe_category, []).append({
                 "title": title,
                 "filename": filename,
             })
+
+            content_hash = sha256(content)
 
             if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(file_path):
                 unchanged += 1
@@ -497,6 +587,13 @@ def sync(args: argparse.Namespace) -> None:
 
     if not args.dry_run:
         save_cache(new_cache)
+        # Commit the source snapshot only after every document request
+        # succeeded. A partial run must retry instead of qualifying for the
+        # source-manifest fast path on its next invocation.
+        if len(doc_contents) == len(docs):
+            with open(PROVIDER_DOCS_FILE, "w") as f:
+                json.dump(version_data, f, indent=2)
+                f.write("\n")
 
     total_docs = sum(len(d) for d in category_docs.values())
 

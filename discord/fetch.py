@@ -13,6 +13,7 @@ titles for category READMEs.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -32,7 +33,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 24
 
 
 def sha256(content: str) -> str:
@@ -40,10 +41,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "discord-api-docs-fetcher/1.0"})
+    req = Request(url, headers={
+        "User-Agent": "discord-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -278,15 +285,16 @@ def sync(args: argparse.Namespace) -> None:
     new_cache: dict = {}
     categories: dict[str, list[dict]] = {}
 
-    for url in sorted(fetched):
-        raw = fetched[url]
+    for url in sorted(urls):
         category, subpath, file_path = path_for(url)
-        title = titles.get(url)
-        if not title:
+        cache_key = subpath if category != "_root" else f"_root/{subpath}"
+        prev = cache.get(cache_key, {})
+        raw = fetched.get(url)
+        title = titles.get(url) or prev.get("title")
+        if not title and raw is not None:
             m = re.match(r"^# (.+)$", raw, flags=re.MULTILINE)
             title = m.group(1).strip() if m else subpath
-        content = build_page_markdown(raw, titles.get(url), url)
-        content_hash = sha256(content)
+        title = title or subpath
 
         categories.setdefault(category, []).append({
             "subpath": subpath,
@@ -294,11 +302,27 @@ def sync(args: argparse.Namespace) -> None:
             "url": url,
         })
 
-        cache_key = subpath if category != "_root" else f"_root/{subpath}"
-        prev = cache.get(cache_key, {})
+        if raw is None:
+            if prev and os.path.exists(file_path):
+                unchanged += 1
+                new_cache[cache_key] = {
+                    **prev,
+                    "title": title,
+                    "url": url,
+                }
+            else:
+                categories[category].pop()
+            continue
+
+        content = build_page_markdown(raw, titles.get(url), url)
+        content_hash = sha256(content)
         if prev.get("sha256") == content_hash and os.path.exists(file_path):
             unchanged += 1
-            new_cache[cache_key] = prev
+            new_cache[cache_key] = {
+                **prev,
+                "title": title,
+                "url": url,
+            }
             continue
 
         is_new = cache_key not in cache or not os.path.exists(file_path)
@@ -307,11 +331,15 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[cache_key] = {
             "sha256": content_hash,
             "last_updated": datetime.now(timezone.utc).isoformat(),
+            "title": title,
+            "url": url,
         }
         if is_new:
             added += 1
         else:
             updated += 1
+
+    categories = {name: pages for name, pages in categories.items() if pages}
 
     # Category READMEs
     for category, pages in categories.items():

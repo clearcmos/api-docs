@@ -14,6 +14,7 @@ showcase. Other locales (zh, ja, de, fr, ru, pt-BR) are skipped intentionally.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -35,8 +36,9 @@ RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
+SOURCE_CACHE_KEY = "__source__/tree"
 
-MAX_WORKERS = 8
+MAX_WORKERS = 16
 
 
 def sha256(content: str) -> str:
@@ -44,14 +46,20 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    headers = {"User-Agent": "qwen-code-docs-fetcher/1.0"}
+    headers = {
+        "User-Agent": "qwen-code-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    }
     token = os.environ.get("GITHUB_TOKEN")
     if token and "api.github.com" in url:
         headers["Authorization"] = f"Bearer {token}"
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         if e.code == 404:
             return None
@@ -91,8 +99,8 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # Discovery
 # ---------------------------------------------------------------------------
 
-def discover_paths() -> list[str]:
-    """Return all en/ .md/.mdx file paths from the repo tree."""
+def discover_paths() -> tuple[list[str], str]:
+    """Return source paths and a hash of their Git blobs."""
     print("Fetching repository tree...")
     body = fetch_url(TREE_URL, timeout=90)
     if not body:
@@ -102,14 +110,26 @@ def discover_paths() -> list[str]:
     if data.get("truncated"):
         print("WARNING: tree response truncated; some files may be missing",
               file=sys.stderr)
-    paths = [
-        t["path"]
+    blobs = [
+        (t["path"], t.get("sha", ""))
         for t in data.get("tree", [])
         if t.get("type") == "blob"
         and t["path"].startswith(CONTENT_PREFIX)
         and (t["path"].endswith(".md") or t["path"].endswith(".mdx"))
     ]
-    return sorted(paths)
+    with open(__file__, "rb") as f:
+        fetcher_hash = hashlib.sha256(f.read()).hexdigest()
+    fingerprint = sha256(json.dumps({
+        "blobs": sorted(blobs),
+        "fetcher": fetcher_hash,
+    }, separators=(",", ":")))
+    return sorted(path for path, _ in blobs), fingerprint
+
+
+def source_outputs_complete(source: dict) -> bool:
+    outputs = source.get("outputs", [])
+    return bool(outputs) and all(
+        os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
 
 
 def site_url_for(rel_path: str) -> str:
@@ -266,8 +286,24 @@ def build_section_readme(section: str, pages: list[dict]) -> str:
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
 
-    repo_paths = discover_paths()
+    repo_paths, source_fingerprint = discover_paths()
     print(f"  found {len(repo_paths)} en/ markdown files")
+
+    previous_source = cache.get(SOURCE_CACHE_KEY, {})
+    if (not args.force
+            and previous_source.get("fingerprint") == source_fingerprint
+            and source_outputs_complete(previous_source)):
+        total_files = len(previous_source["outputs"])
+        print("  Source tree unchanged and all outputs present; "
+              "skipping content downloads and conversion")
+        print("\nSync complete:")
+        print("  Added:       0")
+        print("  Updated:     0")
+        print(f"  Unchanged:   {total_files}")
+        print("  Removed:     0")
+        print("  Unavailable: 0")
+        print(f"  Total pages: {previous_source.get('page_count', 0)}")
+        return
 
     print(f"Fetching content (concurrency={MAX_WORKERS})...")
 
@@ -291,6 +327,9 @@ def sync(args: argparse.Namespace) -> None:
         if args.verbose:
             for rp in sorted(missing):
                 print(f"    SKIP {rp}")
+        print("ERROR: source tree entries could not be fetched; leaving the "
+              "existing mirror untouched", file=sys.stderr)
+        sys.exit(1)
 
     if not args.dry_run:
         os.makedirs(DOCS_DIR, exist_ok=True)
@@ -300,6 +339,7 @@ def sync(args: argparse.Namespace) -> None:
     unchanged = 0
     new_cache: dict = {}
     pages: list[dict] = []  # {rel, title, ...}
+    output_paths: set[str] = set()
 
     for rp in repo_paths:
         raw = fetched.get(rp)
@@ -312,6 +352,7 @@ def sync(args: argparse.Namespace) -> None:
         repo_url = f"https://github.com/{REPO}/blob/{BRANCH}/{rp}"
         page, title = build_page_markdown(raw, source_url, repo_url)
         file_path = output_path_for(content_rel)
+        output_paths.add(os.path.relpath(file_path, DOCS_DIR))
         cache_key = content_rel
 
         parts = rel_no_ext.split("/")
@@ -363,6 +404,7 @@ def sync(args: argparse.Namespace) -> None:
     for section, section_pages in by_section.items():
         readme_content = build_section_readme(section, section_pages)
         readme_path = os.path.join(DOCS_DIR, section, "README.md")
+        output_paths.add(os.path.relpath(readme_path, DOCS_DIR))
         cache_key = f"__readme__/{section}"
         content_hash = sha256(readme_content)
         prev = cache.get(cache_key, {})
@@ -385,6 +427,7 @@ def sync(args: argparse.Namespace) -> None:
     # Top-level README
     top_readme = build_top_readme(pages)
     top_path = os.path.join(DOCS_DIR, "README.md")
+    output_paths.add(os.path.relpath(top_path, DOCS_DIR))
     top_key = "__readme__/_top"
     top_hash = sha256(top_readme)
     prev = cache.get(top_key, {})
@@ -404,10 +447,19 @@ def sync(args: argparse.Namespace) -> None:
         else:
             updated += 1
 
+    new_cache[SOURCE_CACHE_KEY] = {
+        "fingerprint": source_fingerprint,
+        "outputs": sorted(output_paths),
+        "page_count": len(pages),
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+
     # Removals
     removed = 0
     for old_key in sorted(cache):
         if old_key in new_cache:
+            continue
+        if old_key == SOURCE_CACHE_KEY:
             continue
         if old_key.startswith("__readme__/"):
             name = old_key[len("__readme__/"):]

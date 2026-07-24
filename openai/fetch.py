@@ -16,6 +16,7 @@ lands at
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -33,26 +34,39 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
-MAX_WORKERS = 12
+MAX_WORKERS = 30
 
 
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": "openai-api-docs-fetcher/1.0"})
+def fetch_url(
+    url: str, timeout: int = 60, etag: str | None = None
+) -> tuple[str | None, str | None, bool]:
+    headers = {
+        "User-Agent": "openai-api-docs-fetcher/1.0",
+        "Accept-Encoding": "gzip",
+    }
+    if etag:
+        headers["If-None-Match"] = etag
+    req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8"), resp.headers.get("ETag"), False
     except HTTPError as e:
+        if e.code == 304:
+            return None, e.headers.get("ETag") or etag, True
         if e.code == 404:
-            return None
+            return None, None, False
         print(f"ERROR: {url}: HTTP {e.code}", file=sys.stderr)
-        return None
+        return None, None, False
     except (URLError, TimeoutError, OSError) as e:
         print(f"ERROR: {url}: {e}", file=sys.stderr)
-        return None
+        return None, None, False
 
 
 def load_cache() -> dict:
@@ -215,7 +229,7 @@ def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
 
     print("Fetching llms.txt...")
-    index_text = fetch_url(LLMS_INDEX_URL)
+    index_text, _, _ = fetch_url(LLMS_INDEX_URL)
     if not index_text:
         print("ERROR: failed to fetch llms.txt", file=sys.stderr)
         sys.exit(1)
@@ -244,22 +258,34 @@ def sync(args: argparse.Namespace) -> None:
 
     print(f"Fetching {len(doc_entries)} pages (concurrency={MAX_WORKERS})...")
 
-    fetched: dict[str, str] = {}
+    fetched: dict[str, tuple[str, str | None]] = {}
+    validated: dict[str, str | None] = {}
     missing: list[str] = []
 
-    def fetch_one(entry: dict) -> tuple[dict, str | None]:
-        return entry, fetch_url(entry["url"])
+    def fetch_one(
+        entry: dict
+    ) -> tuple[dict, str | None, str | None, bool]:
+        url = entry["url"]
+        cache_key = url_rel_path(url)
+        file_path = file_path_for_url(url)
+        etag = None
+        if os.path.exists(file_path):
+            etag = cache.get(cache_key, {}).get("etag")
+        content, response_etag, not_modified = fetch_url(url, etag=etag)
+        return entry, content, response_etag, not_modified
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = [pool.submit(fetch_one, e) for e in doc_entries]
         for fut in as_completed(futures):
-            entry, content = fut.result()
-            if content is None:
+            entry, content, etag, not_modified = fut.result()
+            if not_modified:
+                validated[entry["url"]] = etag
+            elif content is None:
                 missing.append(entry["url"])
             else:
-                fetched[entry["url"]] = content
+                fetched[entry["url"]] = (content, etag)
 
-    print(f"  fetched: {len(fetched)}")
+    print(f"  fetched: {len(fetched)}; ETag unchanged: {len(validated)}")
     if missing:
         print(f"  unavailable (.md 404): {len(missing)}")
         if args.verbose:
@@ -276,18 +302,33 @@ def sync(args: argparse.Namespace) -> None:
 
     for entry in doc_entries:
         url = entry["url"]
-        raw = fetched.get(url)
-        if raw is None:
-            continue
         file_path = file_path_for_url(url)
+        cache_key = url_rel_path(url)
+        prev = cache.get(cache_key, {})
+
+        if url in validated:
+            unchanged += 1
+            new_cache[cache_key] = {
+                **prev,
+                "etag": validated[url],
+            }
+            continue
+
+        fetched_page = fetched.get(url)
+        if fetched_page is None:
+            # A listed page can transiently fail or briefly return 404 during
+            # a deployment. Preserve the last known-good file and cache entry.
+            if prev and os.path.exists(file_path):
+                unchanged += 1
+                new_cache[cache_key] = prev
+            continue
+        raw, etag = fetched_page
         content = build_page_markdown(raw, entry["title"], url)
         content_hash = sha256(content)
 
-        cache_key = url_rel_path(url)
-        prev = cache.get(cache_key, {})
         if prev.get("sha256") == content_hash and os.path.exists(file_path):
             unchanged += 1
-            new_cache[cache_key] = prev
+            new_cache[cache_key] = {**prev, "etag": etag}
             continue
 
         is_new = cache_key not in cache or not os.path.exists(file_path)
@@ -296,6 +337,7 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[cache_key] = {
             "sha256": content_hash,
             "last_updated": datetime.now(timezone.utc).isoformat(),
+            "etag": etag,
         }
         if is_new:
             added += 1

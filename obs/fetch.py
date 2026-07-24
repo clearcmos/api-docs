@@ -28,6 +28,7 @@ from recursively parsing `.. toctree::` directives starting at index.rst.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -56,10 +57,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={"User-Agent": USER_AGENT})
+    req = Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept-Encoding": "gzip",
+    })
     try:
         with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
+            data = resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                data = gzip.decompress(data)
+            return data.decode("utf-8")
     except HTTPError as e:
         if e.code == 404:
             return None
