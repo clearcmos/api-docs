@@ -16,6 +16,17 @@ Uses the Terraform Registry v1/v2 API:
   2. v1 endpoint to discover the latest provider version and doc list
   3. v2 JSON:API endpoint to fetch individual doc content
 
+Each provider's docs live under docs/{org}/{name}/ and its cache keys are
+prefixed with "{org}/{name}|", so multiple providers coexist in one checkout
+and reconciling one never touches another's files.
+
+The registry serves no ETag or Last-Modified (measured), so the incremental
+fast path is a per-provider source fingerprint instead: provider version +
+a hash of the docs manifest (immutable doc IDs plus output-relevant metadata)
++ the fetcher hash, recorded in .cache.json under "source:{org}/{name}" with
+the outputs it produced. When all of it matches and every recorded output is
+on disk, a routine sync is two registry requests and zero per-document ones.
+
 Examples:
     python fetch.py --provider hashicorp/googleworkspace
     python fetch.py --provider hashicorp/aws --dry-run
@@ -30,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
@@ -47,6 +59,8 @@ INDEX_FILE = os.path.join(SCRIPT_DIR, "provider-index.json")
 PROVIDER_DOCS_FILE = os.path.join(SCRIPT_DIR, "provider-docs.json")
 
 INDEX_MAX_AGE_HOURS = 24
+# Doc-body workers. Measured on integrations/github (164 docs): 8 workers took
+# ~4.0s, 16 took ~2.7s, both with zero failures from the registry.
 MAX_WORKERS = 16
 
 
@@ -58,20 +72,61 @@ def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+# Transient-failure policy. A 404 is a permanent answer, so only these statuses
+# are worth a second round trip.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+MAX_RETRIES = 3
+MAX_BACKOFF = 30.0
+# Retries are bounded by total time per URL as well as attempt count. This is
+# what discriminates a cheap transient failure, which is worth retrying, from an
+# endpoint that is simply slow to fail: Google's retired poly and datalabeling
+# discovery endpoints hang ~20s before each 502, so retrying them turned a 30s
+# run into 98s while recovering nothing. A fast 503 still gets its full retries;
+# a failure that already cost this long does not, and the next run picks it up.
+RETRY_DEADLINE = 20.0
+
+
+def out_of_budget(attempt: int, started: float, cap: int = MAX_RETRIES) -> bool:
+    """True once this URL has spent its retry budget (attempts or time)."""
+    return attempt >= cap or (time.monotonic() - started) >= RETRY_DEADLINE
+
+
+def retry_wait(attempt: int, err: HTTPError | None = None) -> float:
+    """Bounded exponential backoff, honoring Retry-After when the origin sends one."""
+    if err is not None and err.headers:
+        retry_after = err.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), MAX_BACKOFF)
+            except ValueError:
+                pass
+    return min(1.5 * (2 ** attempt), MAX_BACKOFF)
+
+
 def fetch_url(url: str, timeout: int = 60) -> str | None:
     req = Request(url, headers={
         "User-Agent": "terraform-api-docs-fetcher/1.0",
         "Accept-Encoding": "gzip",
     })
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
-                data = gzip.decompress(data)
-            return data.decode("utf-8")
-    except (HTTPError, URLError, TimeoutError, OSError) as e:
-        print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
-        return None
+    started = time.monotonic()
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+                if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+                    data = gzip.decompress(data)
+                return data.decode("utf-8")
+        except HTTPError as e:
+            if e.code not in RETRYABLE_STATUS or out_of_budget(attempt, started):
+                print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
+                return None
+            time.sleep(retry_wait(attempt, e))
+        except (URLError, TimeoutError, OSError) as e:
+            if out_of_budget(attempt, started):
+                print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
+                return None
+            time.sleep(retry_wait(attempt))
+    return None
 
 
 def sanitize_filename(name: str) -> str:
@@ -103,6 +158,28 @@ def strip_frontmatter(content: str) -> str:
     return content
 
 
+def fetcher_hash() -> str:
+    """SHA256 of this script.
+
+    Folded into the source fingerprint so a converter change is picked up by a
+    routine run instead of needing --force.
+    """
+    with open(os.path.abspath(__file__), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def outputs_present(entry: dict) -> bool:
+    """True when every output the cached source produced is still on disk.
+
+    A source-level cache hit is only valid if its outputs survived; a deleted
+    file has to force regeneration.
+    """
+    outputs = entry.get("outputs")
+    if not outputs:
+        return False
+    return all(os.path.exists(os.path.join(DOCS_DIR, rel)) for rel in outputs)
+
+
 def docs_manifest_hash(docs: list[dict]) -> str:
     """Hash the immutable Registry document IDs and output-relevant metadata."""
     manifest = [
@@ -118,35 +195,6 @@ def docs_manifest_hash(docs: list[dict]) -> str:
         item["category"], item["slug"], item["id"], item["title"]
     ))
     return sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
-
-
-def load_provider_docs_snapshot() -> dict:
-    if not os.path.exists(PROVIDER_DOCS_FILE):
-        return {}
-    try:
-        with open(PROVIDER_DOCS_FILE, "r") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def cache_is_complete(docs: list[dict], cache: dict) -> bool:
-    expected: set[tuple[str, str]] = set()
-    categories: set[str] = set()
-    for doc in docs:
-        category = sanitize_filename(doc.get("category", "other"))
-        slug = doc.get("slug", doc.get("title", "untitled"))
-        filename = f"{sanitize_filename(slug)}.md"
-        expected.add((f"{category}:{filename}",
-                      os.path.join(DOCS_DIR, category, filename)))
-        categories.add(category)
-    for category in categories:
-        expected.add((f"{category}:README.md",
-                      os.path.join(DOCS_DIR, category, "README.md")))
-    return (
-        os.path.exists(os.path.join(DOCS_DIR, "README.md"))
-        and all(key in cache and os.path.exists(path) for key, path in expected)
-    )
 
 
 def fetch_doc_content(doc_id: str) -> dict | None:
@@ -365,10 +413,23 @@ def build_top_readme(provider: str, version: str, categories: dict[str, list[dic
 # Sync
 # ---------------------------------------------------------------------------
 
+def _provider_docs_dir(provider: str) -> str:
+    """Each provider gets its own subtree: docs/{org}/{name}/. Keeps multiple
+    providers from overwriting each other's files and READMEs."""
+    org, name = provider.split("/", 1)
+    return os.path.join(DOCS_DIR, sanitize_filename(org), sanitize_filename(name))
+
+
 def sync(args: argparse.Namespace) -> None:
     provider = args.provider
-    cache = {} if args.force else load_cache()
-    previous_snapshot = load_provider_docs_snapshot()
+    # --force disables the unchanged-skip for THIS provider, but the previous
+    # cache is still needed to preserve other providers' entries and to detect
+    # this provider's removals safely, so load it either way.
+    prev_cache = load_cache()
+    cache = {} if args.force else prev_cache
+    provider_docs_dir = _provider_docs_dir(provider)
+    cache_prefix = f"{provider}|"
+    source_key = f"source:{provider}"
 
     v1_url = f"{REGISTRY_V1}/{provider}"
 
@@ -393,33 +454,35 @@ def sync(args: argparse.Namespace) -> None:
     docs = version_data.get("docs", [])
     print(f"  Found {len(docs)} documentation pages")
 
-    snapshot_provider = (
-        f"{previous_snapshot.get('namespace', '')}/"
-        f"{previous_snapshot.get('name', '')}"
-    ).strip("/")
-    same_manifest = (
-        not args.force
-        and snapshot_provider == provider
-        and previous_snapshot.get("version") == latest_version
-        and docs_manifest_hash(previous_snapshot.get("docs", []))
-            == docs_manifest_hash(docs)
-    )
-    if same_manifest and cache_is_complete(docs, cache):
-        category_count = len({
-            sanitize_filename(doc.get("category", "other")) for doc in docs
-        })
-        file_count = len(cache)
-        print("  Manifest unchanged and local cache complete; "
+    # Source-manifest fast path. The registry serves no validators, but doc IDs
+    # are immutable and content is fixed per published version, so an unchanged
+    # version + docs manifest + fetcher proves the outputs current -- as long as
+    # every output the last full run recorded is still on disk.
+    prev_source = prev_cache.get(source_key, {}) if not args.force else {}
+    manifest_hash = docs_manifest_hash(docs)
+    if (
+        prev_source.get("version") == latest_version
+        and prev_source.get("manifest_sha256") == manifest_hash
+        and prev_source.get("fetcher_sha256") == fetcher_hash()
+        and outputs_present(prev_source)
+    ):
+        print("  version and docs manifest unchanged, all outputs present; "
               "skipping individual document downloads")
+        if not args.dry_run:
+            save_cache(prev_cache)
         print("\nSync complete:")
         print("  Added:        0")
         print("  Updated:      0")
-        print(f"  Unchanged:    {file_count}")
+        print(f"  Unchanged:    {len(prev_source['outputs'])}")
         print("  Removed:      0")
-        print(f"  Total files:  {file_count}")
-        print(f"  Total categories: {category_count}")
+        print(f"  Total files:  {len(prev_source['outputs'])}")
         print(f"  Total docs:   {len(docs)}")
         return
+
+    if not args.dry_run:
+        with open(PROVIDER_DOCS_FILE, "w") as f:
+            json.dump(version_data, f, indent=2)
+            f.write("\n")
 
     # Organize docs by category
     categories: dict[str, list[dict]] = {}
@@ -452,18 +515,26 @@ def sync(args: argparse.Namespace) -> None:
     print(f"  Fetched {len(doc_contents)}/{len(docs)} docs")
 
     if not args.dry_run:
-        os.makedirs(DOCS_DIR, exist_ok=True)
+        os.makedirs(provider_docs_dir, exist_ok=True)
 
     added = 0
     updated = 0
     unchanged = 0
-    new_cache: dict = {}
+    # Start from the previous cache (not the possibly force-emptied view) so
+    # other providers' entries and source fingerprints always survive; this
+    # provider's own source entry is re-recorded only after a full success.
+    new_cache: dict = {
+        k: v for k, v in prev_cache.items()
+        if not k.startswith(cache_prefix) and k != source_key
+    }
+    # Track keys rebuilt this run so we know what belongs to this provider now.
+    rebuilt_keys: set[str] = set()
 
     category_docs: dict[str, list[dict]] = {}
 
     for category in sorted(categories.keys()):
         safe_category = sanitize_filename(category)
-        category_dir = os.path.join(DOCS_DIR, safe_category)
+        category_dir = os.path.join(provider_docs_dir, safe_category)
 
         if not args.dry_run:
             os.makedirs(category_dir, exist_ok=True)
@@ -473,35 +544,34 @@ def sync(args: argparse.Namespace) -> None:
             title = doc.get("title", doc.get("slug", "untitled"))
             slug = doc.get("slug", title)
             filename = f"{sanitize_filename(slug)}.md"
-            cache_key = f"{safe_category}:{filename}"
+            cache_key = f"{cache_prefix}{safe_category}:{filename}"
             file_path = os.path.join(category_dir, filename)
 
             attrs = doc_contents.get(doc_id)
-            if not attrs:
-                if cache_key in cache and os.path.exists(file_path):
-                    new_cache[cache_key] = cache[cache_key]
+            content = strip_frontmatter(attrs.get("content", "")) if attrs else ""
+            if not content:
+                # A failed or empty body is not a removal: the doc is still in
+                # the authoritative list, so keep the last known-good file, its
+                # cache entry, and its README line. prev_cache, not the
+                # force-emptied view, so --force cannot turn a transient
+                # failure into a deletion either.
+                if cache_key in prev_cache and os.path.exists(file_path):
+                    new_cache[cache_key] = prev_cache[cache_key]
+                    rebuilt_keys.add(cache_key)
+                    unchanged += 1
                     category_docs.setdefault(safe_category, []).append({
                         "title": title,
                         "filename": filename,
                     })
                 continue
 
-            content = strip_frontmatter(attrs.get("content", ""))
-            if not content:
-                if cache_key in cache and os.path.exists(file_path):
-                    new_cache[cache_key] = cache[cache_key]
-                    category_docs.setdefault(safe_category, []).append({
-                        "title": title,
-                        "filename": filename,
-                    })
-                continue
+            content_hash = sha256(content)
+            rebuilt_keys.add(cache_key)
 
             category_docs.setdefault(safe_category, []).append({
                 "title": title,
                 "filename": filename,
             })
-
-            content_hash = sha256(content)
 
             if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(file_path):
                 unchanged += 1
@@ -529,7 +599,8 @@ def sync(args: argparse.Namespace) -> None:
         if cat_pages:
             readme_content = build_category_readme(category, cat_pages)
             readme_path = os.path.join(category_dir, "README.md")
-            cache_key = f"{safe_category}:README.md"
+            cache_key = f"{cache_prefix}{safe_category}:README.md"
+            rebuilt_keys.add(cache_key)
             content_hash = sha256(readme_content)
 
             if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(readme_path):
@@ -553,47 +624,62 @@ def sync(args: argparse.Namespace) -> None:
                 else:
                     updated += 1
 
-    # Write top-level README
+    # Write provider README (top of this provider's subtree)
     top_readme = build_top_readme(provider, latest_version, category_docs)
-    top_readme_path = os.path.join(DOCS_DIR, "README.md")
+    top_readme_path = os.path.join(provider_docs_dir, "README.md")
     if not args.dry_run:
         with open(top_readme_path, "w") as f:
             f.write(top_readme)
 
-    # Detect removals
+    # Detect removals — only consider cache keys belonging to this provider.
+    # Walk the previous cache, not the force-emptied view, so --force runs
+    # still notice docs that left the manifest.
     removed = 0
-    for old_key in sorted(cache):
-        if old_key not in new_cache:
-            parts = old_key.split(":", 1)
-            if len(parts) == 2:
-                cat_dir, fname = parts
-                old_path = os.path.join(DOCS_DIR, cat_dir, fname)
-                if os.path.exists(old_path):
-                    if args.dry_run:
+    for old_key in sorted(prev_cache):
+        if not old_key.startswith(cache_prefix):
+            continue
+        if old_key in rebuilt_keys:
+            continue
+        relative = old_key[len(cache_prefix):]
+        parts = relative.split(":", 1)
+        if len(parts) == 2:
+            cat_dir, fname = parts
+            old_path = os.path.join(provider_docs_dir, cat_dir, fname)
+            if os.path.exists(old_path):
+                if args.dry_run:
+                    print(f"  REMOVE {cat_dir}/{fname}")
+                else:
+                    os.remove(old_path)
+                    if args.verbose:
                         print(f"  REMOVE {cat_dir}/{fname}")
-                    else:
-                        os.remove(old_path)
-                        if args.verbose:
-                            print(f"  REMOVE {cat_dir}/{fname}")
-                    removed += 1
+                removed += 1
+            new_cache.pop(old_key, None)
 
-    # Clean empty dirs
-    if not args.dry_run:
-        for entry in os.scandir(DOCS_DIR):
+    # Clean empty dirs inside this provider's subtree.
+    if not args.dry_run and os.path.isdir(provider_docs_dir):
+        for entry in os.scandir(provider_docs_dir):
             if entry.is_dir() and not os.listdir(entry.path):
                 os.rmdir(entry.path)
                 if args.verbose:
                     print(f"  RMDIR {entry.name}/")
 
     if not args.dry_run:
-        save_cache(new_cache)
-        # Commit the source snapshot only after every document request
+        # Record the source fingerprint only after every document request
         # succeeded. A partial run must retry instead of qualifying for the
-        # source-manifest fast path on its next invocation.
+        # fast path on its next invocation.
         if len(doc_contents) == len(docs):
-            with open(PROVIDER_DOCS_FILE, "w") as f:
-                json.dump(version_data, f, indent=2)
-                f.write("\n")
+            outputs = [os.path.relpath(top_readme_path, DOCS_DIR)]
+            for key in rebuilt_keys:
+                cat_dir, fname = key[len(cache_prefix):].split(":", 1)
+                outputs.append(os.path.relpath(
+                    os.path.join(provider_docs_dir, cat_dir, fname), DOCS_DIR))
+            new_cache[source_key] = {
+                "version": latest_version,
+                "manifest_sha256": manifest_hash,
+                "fetcher_sha256": fetcher_hash(),
+                "outputs": sorted(outputs),
+            }
+        save_cache(new_cache)
 
     total_docs = sum(len(d) for d in category_docs.values())
 
