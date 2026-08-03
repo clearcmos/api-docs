@@ -16,7 +16,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -33,14 +34,17 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 30) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "anthropic-docs-fetcher/1.0",
-        "Accept": "text/html,text/plain,text/markdown,*/*",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "anthropic-docs-fetcher/1.0",
+            "Accept": "text/html,text/plain,text/markdown,*/*",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -128,8 +132,16 @@ def clean_markdown(raw_md: str) -> str:
 
     # Strip JSX-style component tags but keep their content
     # e.g. <Tabs>, <Tab title="...">, <Accordion>, <Info>, <Tip>, <Warning>, etc.
-    result = re.sub(r"<(Tabs|Tab|Accordion|AccordionGroup|Info|Tip|Warning|Note|Steps|Step|Card|CardGroup|CodeGroup|Callout|Frame)[^>]*/?>", "", result)
-    result = re.sub(r"</(Tabs|Tab|Accordion|AccordionGroup|Info|Tip|Warning|Note|Steps|Step|Card|CardGroup|CodeGroup|Callout|Frame)>", "", result)
+    result = re.sub(
+        r"<(Tabs|Tab|Accordion|AccordionGroup|Info|Tip|Warning|Note|Steps|Step|Card|CardGroup|CodeGroup|Callout|Frame)[^>]*/?>",
+        "",
+        result,
+    )
+    result = re.sub(
+        r"</(Tabs|Tab|Accordion|AccordionGroup|Info|Tip|Warning|Note|Steps|Step|Card|CardGroup|CodeGroup|Callout|Frame)>",
+        "",
+        result,
+    )
 
     # Remove excessive blank lines (3+ -> 2)
     result = re.sub(r"\n{3,}", "\n\n", result)
@@ -174,7 +186,9 @@ def build_category_readme(category: str, pages: list[dict]) -> str:
 def build_main_readme(categories: dict[str, list[dict]]) -> str:
     """Build the top-level docs/README.md."""
     lines = ["# Anthropic Claude Code Documentation\n"]
-    lines.append("Documentation fetched from [code.claude.com/docs](https://code.claude.com/docs/en/overview).\n")
+    lines.append(
+        "Documentation fetched from [code.claude.com/docs](https://code.claude.com/docs/en/overview).\n"
+    )
     lines.append("## Categories\n")
 
     # Put general first, then alphabetical
@@ -207,8 +221,8 @@ def extract_title(content: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -233,12 +247,14 @@ def sync(args: argparse.Namespace) -> None:
         if category not in page_plan:
             page_plan[category] = []
         filename = slug.replace("/", "-") + ".md"
-        page_plan[category].append({
-            "url": url,
-            "slug": slug,
-            "filename": filename,
-            "title": "",
-        })
+        page_plan[category].append(
+            {
+                "url": url,
+                "slug": slug,
+                "filename": filename,
+                "title": "",
+            }
+        )
 
     categories = sorted(page_plan.keys())
     print(f"  Categories: {', '.join(categories)}")
@@ -267,9 +283,7 @@ def sync(args: argparse.Namespace) -> None:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_item = {
-            executor.submit(
-                fetch_page_content, page["url"], args.verbose
-            ): (category, page)
+            executor.submit(fetch_page_content, page["url"], args.verbose): (category, page)
             for category, page in work_items
         }
 
@@ -294,18 +308,15 @@ def sync(args: argparse.Namespace) -> None:
             page["title"] = extract_title(content)
             content_hash = sha256(content)
 
-            if (
-                cache.get(cache_key, {}).get("sha256") == content_hash
-                and os.path.exists(os.path.join(cat_dir, page["filename"]))
+            if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(
+                os.path.join(cat_dir, page["filename"])
             ):
                 unchanged += 1
                 new_cache[cache_key] = cache[cache_key]
                 # Preserve title from content for README generation
                 continue
 
-            is_new = cache_key not in cache or not os.path.exists(
-                os.path.join(cat_dir, page["filename"])
-            )
+            is_new = cache_key not in cache or not os.path.exists(os.path.join(cat_dir, page["filename"]))
 
             if args.dry_run:
                 print(f"  {'ADD' if is_new else 'UPDATE'} {category}/{page['filename']}")
@@ -318,7 +329,7 @@ def sync(args: argparse.Namespace) -> None:
 
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
                 "title": page["title"],
                 "url": page["url"],
             }
@@ -348,10 +359,7 @@ def sync(args: argparse.Namespace) -> None:
         cache_key = f"{category}:README.md"
         content_hash = sha256(readme_content)
 
-        if (
-            cache.get(cache_key, {}).get("sha256") == content_hash
-            and os.path.exists(readme_path)
-        ):
+        if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(readme_path):
             unchanged += 1
             new_cache[cache_key] = cache[cache_key]
         else:
@@ -365,7 +373,7 @@ def sync(args: argparse.Namespace) -> None:
                     print(f"  {'ADD' if is_new else 'UPDATE'} {category}/README.md")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             entry = f"{category} index ({category}/README.md)"
             if is_new:
@@ -399,17 +407,17 @@ def sync(args: argparse.Namespace) -> None:
 
     # Clean up empty directories
     if not args.dry_run:
-        for entry in os.scandir(DOCS_DIR):
-            if entry.is_dir() and not os.listdir(entry.path):
-                os.rmdir(entry.path)
+        for dir_entry in os.scandir(DOCS_DIR):
+            if dir_entry.is_dir() and not os.listdir(dir_entry.path):
+                os.rmdir(dir_entry.path)
                 if args.verbose:
-                    print(f"  RMDIR {entry.name}/")
+                    print(f"  RMDIR {dir_entry.name}/")
 
     # Save cache
     if not args.dry_run:
         save_cache(new_cache)
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {len(added_items)}")
     print(f"  Updated:    {len(updated_items)}")
     print(f"  Unchanged:  {unchanged}")
@@ -444,9 +452,7 @@ def main():
         action="store_true",
         help="Re-generate everything ignoring cache",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Detailed per-file logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

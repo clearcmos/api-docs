@@ -26,7 +26,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -34,8 +35,7 @@ try:
     import yaml
 except ImportError:
     print(
-        "ERROR: pyyaml is required for this fetcher (YAML-only spec).\n"
-        "Install it with: pip install pyyaml",
+        "ERROR: pyyaml is required for this fetcher (YAML-only spec).\nInstall it with: pip install pyyaml",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -58,21 +58,25 @@ MAX_WORKERS = 16
 # Standard helpers
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "langfuse-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "langfuse-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
-            return data.decode("utf-8")
+            return cast(str, data.decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -86,8 +90,8 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict[str, Any], json.load(f))
     return {}
 
 
@@ -100,6 +104,7 @@ def save_cache(cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # OpenAPI helpers
 # ---------------------------------------------------------------------------
+
 
 def resolve_ref(ref: str, spec: dict) -> dict:
     """Resolve a $ref pointer like '#/components/schemas/Foo'."""
@@ -201,7 +206,7 @@ def schema_to_markdown(schema: dict, spec: dict, depth: int = 0, seen: set | Non
             if len(enum) > 10:
                 enum_str += f", ... ({len(enum)} total)"
             result += f" -- enum: {enum_str}"
-        return result
+        return cast(str, result)
 
     return "any"
 
@@ -365,6 +370,7 @@ def build_tag_readme(tag: str, tag_desc: str, endpoints: list[dict]) -> str:
 # MDX-to-markdown conversion
 # ---------------------------------------------------------------------------
 
+
 def mdx_to_markdown(mdx_content: str) -> str:
     """Convert MDX content to clean markdown.
 
@@ -431,6 +437,7 @@ def mdx_to_markdown(mdx_content: str) -> str:
 # Part 1: sync_api -- OpenAPI spec to markdown
 # ---------------------------------------------------------------------------
 
+
 def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple[int, int, int, int]:
     """Sync OpenAPI spec to markdown. Returns (added, updated, unchanged, removed)."""
     paths = spec.get("paths", {})
@@ -453,13 +460,15 @@ def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace)
             for tag in tags:
                 if tag not in endpoints_by_tag:
                     endpoints_by_tag[tag] = []
-                endpoints_by_tag[tag].append({
-                    "path": path,
-                    "method": method,
-                    "summary": summary,
-                    "filename": filename,
-                    "operation": operation,
-                })
+                endpoints_by_tag[tag].append(
+                    {
+                        "path": path,
+                        "method": method,
+                        "summary": summary,
+                        "filename": filename,
+                        "operation": operation,
+                    }
+                )
 
     if not args.dry_run:
         os.makedirs(API_DOCS_DIR, exist_ok=True)
@@ -497,7 +506,7 @@ def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace)
                     print(f"  {'ADD' if is_new else 'UPDATE'} api/{safe_tag}/README.md")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -525,7 +534,7 @@ def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace)
                         print(f"  {'ADD' if is_new else 'UPDATE'} api/{safe_tag}/{ep['filename']}")
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -583,12 +592,19 @@ def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace)
 # Part 2: sync_self_hosting -- GitHub MDX docs to markdown
 # ---------------------------------------------------------------------------
 
+
 def sync_self_hosting(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple[int, int, int, int]:
     """Sync self-hosting docs from GitHub. Returns (added, updated, unchanged, removed)."""
     print("Fetching GitHub file tree...")
     tree_json = fetch_url(GITHUB_TREE_URL)
     if not tree_json:
         print("ERROR: Could not fetch GitHub file tree", file=sys.stderr)
+        for key, entry in cache.items():
+            if not key.startswith("selfhost:"):
+                continue
+            rel = key.removeprefix("selfhost:")
+            if os.path.exists(os.path.join(SELF_HOSTING_DOCS_DIR, rel)):
+                new_cache[key] = entry
         return 0, 0, 0, 0
 
     tree_data = json.loads(tree_json)
@@ -641,12 +657,33 @@ def sync_self_hosting(cache: dict, new_cache: dict, args: argparse.Namespace) ->
     # section -> [(rel_md_path, title)]
     sections: dict[str, list[tuple[str, str]]] = {}
 
+    def preserve_cached_page(file_path: str) -> bool:
+        rel_path = file_path[len(SELF_HOSTING_PREFIX) + 1 :]
+        md_rel_path = re.sub(r"\.mdx$", ".md", rel_path)
+        cache_key = f"selfhost:{md_rel_path}"
+        target_path = os.path.join(SELF_HOSTING_DOCS_DIR, md_rel_path)
+        if cache_key not in cache or not os.path.exists(target_path):
+            return False
+        try:
+            with open(target_path) as f:
+                content = f.read()
+        except OSError:
+            return False
+        title_match = re.search(r"^title:\s*[\"']?(.+?)[\"']?\s*$", content, re.MULTILINE)
+        title = title_match.group(1) if title_match else os.path.basename(rel_path).replace(".mdx", "")
+        parts = md_rel_path.split("/")
+        section = "" if len(parts) == 1 else parts[0]
+        sections.setdefault(section, []).append((md_rel_path, title))
+        new_cache[cache_key] = cache[cache_key]
+        return True
+
     for file_path in sorted(mdx_files):
         if file_path not in fetched:
+            preserve_cached_page(file_path)
             continue
 
         # Compute relative path from content/self-hosting/
-        rel_path = file_path[len(SELF_HOSTING_PREFIX) + 1:]
+        rel_path = file_path[len(SELF_HOSTING_PREFIX) + 1 :]
         # Convert .mdx -> .md
         md_rel_path = re.sub(r"\.mdx$", ".md", rel_path)
 
@@ -662,10 +699,7 @@ def sync_self_hosting(cache: dict, new_cache: dict, args: argparse.Namespace) ->
 
         # Track in sections
         parts = md_rel_path.split("/")
-        if len(parts) == 1:
-            section = ""
-        else:
-            section = parts[0]
+        section = "" if len(parts) == 1 else parts[0]
         if section not in sections:
             sections[section] = []
         sections[section].append((md_rel_path, title))
@@ -687,7 +721,7 @@ def sync_self_hosting(cache: dict, new_cache: dict, args: argparse.Namespace) ->
                     print(f"  {'ADD' if is_new else 'UPDATE'} self-hosting/{md_rel_path}")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -722,7 +756,7 @@ def sync_self_hosting(cache: dict, new_cache: dict, args: argparse.Namespace) ->
                     f.write(readme_content)
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -756,7 +790,7 @@ def sync_self_hosting(cache: dict, new_cache: dict, args: argparse.Namespace) ->
     removed = 0
     for old_key in sorted(cache):
         if old_key.startswith("selfhost:") and old_key not in new_cache:
-            rel = old_key[len("selfhost:"):]
+            rel = old_key[len("selfhost:") :]
             old_path = os.path.join(SELF_HOSTING_DOCS_DIR, rel)
             if os.path.exists(old_path):
                 if args.dry_run:
@@ -779,6 +813,7 @@ def sync_self_hosting(cache: dict, new_cache: dict, args: argparse.Namespace) ->
 # ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
+
 
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
@@ -828,7 +863,7 @@ def sync(args: argparse.Namespace) -> None:
     total_unchanged = api_unchanged + sh_unchanged
     total_removed = api_removed + sh_removed
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:     {total_added}")
     print(f"  Updated:   {total_updated}")
     print(f"  Unchanged: {total_unchanged}")
@@ -849,9 +884,7 @@ def main():
         action="store_true",
         help="Re-generate everything ignoring cache",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Detailed per-file logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

@@ -44,7 +44,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -59,18 +59,22 @@ CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "sabnzbd-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "sabnzbd-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8", errors="replace")
@@ -87,8 +91,9 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -104,18 +109,33 @@ def save_cache(cache: dict) -> None:
 
 # Tags that introduce a new block; encountering one flushes any pending inline
 # text. The page has many unclosed <p> tags, so we cannot rely on </p>.
-BLOCK_TAGS = {"p", "pre", "figure", "table", "ul", "ol", "hr", "blockquote",
-              "div", "h1", "h2", "h3", "h4", "h5", "h6"}
+BLOCK_TAGS = {
+    "p",
+    "pre",
+    "figure",
+    "table",
+    "ul",
+    "ol",
+    "hr",
+    "blockquote",
+    "div",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+}
 
 
 class WikiSection:
     """A heading and the markdown body that follows it, up to the next heading."""
 
     def __init__(self, level: int, title: str, anchor: str | None, label: str | None):
-        self.level = level          # 0 = preamble, 1 = h1 group, 2 = h2 function
+        self.level = level  # 0 = preamble, 1 = h1 group, 2 = h2 function
         self.title = title
-        self.anchor = anchor        # the id= value (also the api 'mode')
-        self.label = label          # the <span class="label"> badge, e.g. "True/False"
+        self.anchor = anchor  # the id= value (also the api 'mode')
+        self.label = label  # the <span class="label"> badge, e.g. "True/False"
         self.lines: list[str] = []  # markdown block lines
 
     def emit(self, text: str):
@@ -139,11 +159,11 @@ class WikiParser(html.parser.HTMLParser):
         self.sections: list[WikiSection] = [WikiSection(0, "", None, None)]
 
         self._in_content = False
-        self._content_depth = 0     # div nesting inside wiki-content
-        self._skip_depth = 0        # >0 while inside script/style/footer
+        self._content_depth = 0  # div nesting inside wiki-content
+        self._skip_depth = 0  # >0 while inside script/style/footer
         self._skip_tag: str | None = None
 
-        self._line = ""             # pending inline text for the current block
+        self._line = ""  # pending inline text for the current block
 
         # Code-block state.
         self._pre_depth = 0
@@ -158,7 +178,7 @@ class WikiParser(html.parser.HTMLParser):
         self._heading_title = ""
         self._heading_anchor: str | None = None
         self._heading_label: str | None = None
-        self._in_label = False      # inside a <span class="label"> within a heading
+        self._in_label = False  # inside a <span class="label"> within a heading
 
         # Inline emphasis: stack of opening markers to re-close on end tag.
         self._inline_stack: list[str] = []
@@ -169,8 +189,8 @@ class WikiParser(html.parser.HTMLParser):
         self._table_rows: list[list[str]] = []
         self._table_header: list[str] | None = None
         self._row: list[str] = []
-        self._cell = ""             # inline buffer for the current cell
-        self._cell_list_depth = 0   # nested <ul>/<ol> depth inside a cell
+        self._cell = ""  # inline buffer for the current cell
+        self._cell_list_depth = 0  # nested <ul>/<ol> depth inside a cell
 
     # -- helpers ------------------------------------------------------------
 
@@ -421,7 +441,8 @@ class WikiParser(html.parser.HTMLParser):
         self._flush_line()
         depth = len(self._list_stack) - 1
         indent = "  " * max(0, depth)
-        kind, counter = self._list_stack[-1] if self._list_stack else ["ul", 0]
+        kind = str(self._list_stack[-1][0]) if self._list_stack else "ul"
+        counter = int(self._list_stack[-1][1]) if self._list_stack else 0
         if kind == "ol":
             counter += 1
             self._list_stack[-1][1] = counter
@@ -518,12 +539,13 @@ class WikiParser(html.parser.HTMLParser):
 # Section grouping
 # ---------------------------------------------------------------------------
 
+
 class Group:
     def __init__(self, title: str, anchor: str | None):
         self.title = title
         self.anchor = anchor
         self.slug = sanitize_filename(title) or (anchor or "group")
-        self.preamble: list[str] = []   # markdown before the first function
+        self.preamble: list[str] = []  # markdown before the first function
         self.functions: list[dict] = []  # {title, anchor, label, filename, markdown}
 
 
@@ -594,6 +616,7 @@ def group_sections(sections: list[WikiSection]) -> list[Group]:
 # Markdown assembly
 # ---------------------------------------------------------------------------
 
+
 def build_function_markdown(group: Group, func: dict) -> str:
     lines = [f"# {func['title']}\n"]
     meta = []
@@ -603,10 +626,7 @@ def build_function_markdown(group: Group, func: dict) -> str:
         meta.append(f"**Returns:** {func['label']}")
     if meta:
         lines.append("  \n".join(meta) + "\n")
-    if func["anchor"]:
-        src = f"{WIKI_URL}#{func['anchor']}"
-    else:
-        src = WIKI_URL
+    src = f"{WIKI_URL}#{func['anchor']}" if func["anchor"] else WIKI_URL
     lines.append(f"Source: [{src}]({src})\n")
     if func["body"]:
         lines.append(func["body"])
@@ -662,6 +682,7 @@ def build_top_readme(groups: list[Group]) -> str:
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
 
@@ -678,8 +699,7 @@ def sync(args: argparse.Namespace) -> None:
     print(f"  Groups: {len(groups)}")
     print(f"  Functions: {total_funcs}")
     if total_funcs == 0:
-        print("ERROR: no functions parsed -- page structure may have changed",
-              file=sys.stderr)
+        print("ERROR: no functions parsed -- page structure may have changed", file=sys.stderr)
         sys.exit(1)
 
     if not args.dry_run:
@@ -709,7 +729,7 @@ def sync(args: argparse.Namespace) -> None:
                 print(f"  {action} {rel_path}")
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -719,8 +739,7 @@ def sync(args: argparse.Namespace) -> None:
     for g in groups:
         write_file(os.path.join(g.slug, "README.md"), build_group_readme(g))
         for func in g.functions:
-            write_file(os.path.join(g.slug, func["filename"]),
-                       build_function_markdown(g, func))
+            write_file(os.path.join(g.slug, func["filename"]), build_function_markdown(g, func))
 
     write_file("README.md", build_top_readme(groups))
 
@@ -747,7 +766,7 @@ def sync(args: argparse.Namespace) -> None:
                     print(f"  RMDIR {entry.name}/")
         save_cache(new_cache)
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {added}")
     print(f"  Updated:    {updated}")
     print(f"  Unchanged:  {unchanged}")
@@ -759,12 +778,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fetch SABnzbd API docs from the wiki page and convert to markdown"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

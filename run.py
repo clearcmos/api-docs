@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-API Docs Fetcher Runner
+External Docs Fetcher Runner
 
 Discovers all vendor fetch.py scripts dynamically and provides a unified
 interface to run one, several, or all of them.
@@ -45,17 +45,16 @@ def needs_interactive(vendor: str) -> bool:
     """
     fetch_py = os.path.join(SCRIPT_DIR, vendor, "fetch.py")
     try:
-        with open(fetch_py, "r") as f:
+        with open(fetch_py) as f:
             content = f.read()
     except OSError:
         return False
-    return ("# requires-interactive" in content
-            or "required=True" in content
-            or "required_group" in content)
+    return "# requires-interactive" in content or "required=True" in content or "required_group" in content
 
 
-def run_vendor(vendor: str, flags: list[str], passthrough: list[str] | None = None,
-               suppress_stdin: bool = False) -> int:
+def run_vendor(
+    vendor: str, flags: list[str], passthrough: list[str] | None = None, suppress_stdin: bool = False
+) -> int:
     """Run a vendor's fetch.py. Returns exit code."""
     fetch_py = os.path.join(SCRIPT_DIR, vendor, "fetch.py")
     cmd = [sys.executable, fetch_py] + flags
@@ -66,7 +65,7 @@ def run_vendor(vendor: str, flags: list[str], passthrough: list[str] | None = No
     return result.returncode
 
 
-def interactive_pick_fzf(vendors: list[str]) -> list[str]:
+def interactive_pick_fzf(vendors: list[str]) -> list[str] | None:
     """Pick vendors via fzf with multi-select (tab to toggle)."""
     lines = []
     for name in vendors:
@@ -76,9 +75,19 @@ def interactive_pick_fzf(vendors: list[str]) -> list[str]:
 
     try:
         result = subprocess.run(
-            ["fzf", "--multi", "--prompt", "Vendors> ", "--height=40%", "--reverse",
-             "--header", "Tab to multi-select, Enter to confirm"],
-            input=text, capture_output=True, text=True,
+            [
+                "fzf",
+                "--multi",
+                "--prompt",
+                "Vendors> ",
+                "--height=40%",
+                "--reverse",
+                "--header",
+                "Tab to multi-select, Enter to confirm",
+            ],
+            input=text,
+            capture_output=True,
+            text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
             return [line.split()[0] for line in result.stdout.strip().splitlines()]
@@ -94,7 +103,7 @@ def interactive_pick_basic(vendors: list[str]) -> list[str]:
         extra = " (interactive)" if needs_interactive(name) else ""
         print(f"  {i:3d}. {name}{extra}")
 
-    print(f"\nEnter numbers, names, or ranges (e.g. '1 3-5 okta'), or 'all'.")
+    print("\nEnter numbers, names, or ranges (e.g. '1 3-5 okta'), or 'all'.")
     print("Press Ctrl+C to cancel.\n")
 
     try:
@@ -169,7 +178,7 @@ def main():
     passthrough: list[str] = []
     if "--" in argv:
         sep = argv.index("--")
-        passthrough = argv[sep + 1:]
+        passthrough = argv[sep + 1 :]
         argv = argv[:sep]
 
     run_all = "--all" in argv

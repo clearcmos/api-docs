@@ -21,8 +21,8 @@ import json
 import os
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -50,13 +50,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 120) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "auth0-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "auth0-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -73,8 +76,8 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -98,6 +101,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # ---------------------------------------------------------------------------
 # Index parsing
 # ---------------------------------------------------------------------------
+
 
 def discover_api_urls(index_text: str) -> list[str]:
     """Extract API documentation URLs from the llms.txt index."""
@@ -131,7 +135,7 @@ def classify_url(url: str) -> tuple[str, str, str] | None:
 
     for prefix, api_name in API_PREFIXES.items():
         if path.startswith(prefix):
-            remainder = path[len(prefix):]
+            remainder = path[len(prefix) :]
             parts = remainder.split("/")
             if len(parts) == 2:
                 tag, slug = parts
@@ -148,6 +152,7 @@ def classify_url(url: str) -> tuple[str, str, str] | None:
 # ---------------------------------------------------------------------------
 # Markdown formatting
 # ---------------------------------------------------------------------------
+
 
 def build_page_markdown(content: str, source_url: str) -> str:
     """Clean up raw llms-full.txt page content into final markdown."""
@@ -211,6 +216,7 @@ def build_top_readme(api_names: dict[str, int]) -> str:
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
 
@@ -236,7 +242,7 @@ def sync(args: argparse.Namespace) -> None:
     # Build set of source URLs we need content for (strip .md suffix for matching)
     needed_sources = set()
     url_to_clean = {}
-    for api_name, tag, slug, url in classified:
+    for _, _, _, url in classified:
         # llms-full.txt uses URLs without .md suffix
         clean = url.removesuffix(".md")
         needed_sources.add(clean)
@@ -252,7 +258,7 @@ def sync(args: argparse.Namespace) -> None:
 
     # Match content to classified pages
     matched = 0
-    for api_name, tag, slug, url in classified:
+    for _, _, _, url in classified:
         clean = url_to_clean[url]
         if clean in all_pages:
             matched += 1
@@ -273,9 +279,23 @@ def sync(args: argparse.Namespace) -> None:
     for api_name, tag, slug, url in classified:
         clean = url_to_clean[url]
         raw_content = all_pages.get(clean)
+        if tag:
+            file_path = os.path.join(DOCS_DIR, api_name, tag, f"{slug}.md")
+            cache_key = f"{api_name}:{tag}:{slug}"
+        else:
+            file_path = os.path.join(DOCS_DIR, api_name, f"{slug}.md")
+            cache_key = f"{api_name}::{slug}"
         if not raw_content:
             if args.verbose:
                 print(f"  SKIP (no content) {api_name}/{tag}/{slug}")
+            previous = cache.get(cache_key, {})
+            if previous and os.path.exists(file_path):
+                title = previous.get("title") or slug.replace("-", " ").title()
+                api_tags.setdefault(api_name, {}).setdefault(tag, []).append(
+                    {"slug": slug, "title": title, "tag": tag}
+                )
+                new_cache[cache_key] = previous
+                unchanged += 1
             continue
 
         # Extract title from first line
@@ -285,29 +305,30 @@ def sync(args: argparse.Namespace) -> None:
         content = build_page_markdown(raw_content, url)
         content_hash = sha256(content)
 
-        if tag:
-            file_path = os.path.join(DOCS_DIR, api_name, tag, f"{slug}.md")
-            cache_key = f"{api_name}:{tag}:{slug}"
-        else:
-            file_path = os.path.join(DOCS_DIR, api_name, f"{slug}.md")
-            cache_key = f"{api_name}::{slug}"
-
-        api_tags.setdefault(api_name, {}).setdefault(tag, []).append({
-            "slug": slug,
-            "title": title,
-            "tag": tag,
-        })
+        api_tags.setdefault(api_name, {}).setdefault(tag, []).append(
+            {
+                "slug": slug,
+                "title": title,
+                "tag": tag,
+            }
+        )
 
         if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(file_path):
             unchanged += 1
             new_cache[cache_key] = cache[cache_key]
         else:
             is_new = cache_key not in cache or not os.path.exists(file_path)
-            write_file(file_path, content, dry_run=args.dry_run, verbose=args.verbose,
-                       label="ADD" if is_new else "UPDATE")
+            write_file(
+                file_path,
+                content,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+                label="ADD" if is_new else "UPDATE",
+            )
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
+                "title": title,
             }
             if is_new:
                 added += 1
@@ -329,11 +350,16 @@ def sync(args: argparse.Namespace) -> None:
                 new_cache[cache_key] = cache[cache_key]
             else:
                 is_new = cache_key not in cache or not os.path.exists(readme_path)
-                write_file(readme_path, readme_content, dry_run=args.dry_run, verbose=args.verbose,
-                           label="ADD" if is_new else "UPDATE")
+                write_file(
+                    readme_path,
+                    readme_content,
+                    dry_run=args.dry_run,
+                    verbose=args.verbose,
+                    label="ADD" if is_new else "UPDATE",
+                )
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -352,11 +378,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = cache[cache_key]
         else:
             is_new = cache_key not in cache or not os.path.exists(readme_path)
-            write_file(readme_path, readme_content, dry_run=args.dry_run, verbose=args.verbose,
-                       label="ADD" if is_new else "UPDATE")
+            write_file(
+                readme_path,
+                readme_content,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+                label="ADD" if is_new else "UPDATE",
+            )
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -415,7 +446,7 @@ def sync(args: argparse.Namespace) -> None:
     total_pages = sum(len(pages) for tags in api_tags.values() for pages in tags.values())
     total_tags = sum(1 for tags in api_tags.values() for t in tags if t)
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:       {added}")
     print(f"  Updated:     {updated}")
     print(f"  Unchanged:   {unchanged}")
@@ -429,9 +460,7 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fetch Auth0 API docs and convert to local markdown"
-    )
+    parser = argparse.ArgumentParser(description="Fetch Auth0 API docs and convert to local markdown")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -442,9 +471,7 @@ def main():
         action="store_true",
         help="Re-generate everything ignoring cache",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Detailed per-file logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

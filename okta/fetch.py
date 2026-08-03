@@ -31,9 +31,9 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 try:
@@ -50,10 +50,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-GITHUB_BASE = (
-    "https://raw.githubusercontent.com/okta/okta-management-openapi-spec"
-    "/master/dist/current"
-)
+GITHUB_BASE = "https://raw.githubusercontent.com/okta/okta-management-openapi-spec/master/dist/current"
 
 API_SPECS = {
     "management": {
@@ -101,13 +98,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "okta-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "okta-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -142,10 +142,9 @@ def fetch_url_with_retry(
             if e.code == 304:
                 return None, e.headers.get("ETag") or etag, True
             if e.code in (429, 503) and attempt < MAX_RETRIES - 1:
-                wait = RETRY_DELAY * (2 ** attempt)
+                wait = RETRY_DELAY * (2**attempt)
                 print(
-                    f"    {e.code} for {url}, backing off {wait}s "
-                    f"(attempt {attempt + 1}/{MAX_RETRIES})",
+                    f"    {e.code} for {url}, backing off {wait}s (attempt {attempt + 1}/{MAX_RETRIES})",
                     file=sys.stderr,
                 )
                 time.sleep(wait)
@@ -153,22 +152,20 @@ def fetch_url_with_retry(
             if e.code == 404:
                 return None, None, False
             if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY * (2 ** attempt))
+                time.sleep(RETRY_DELAY * (2**attempt))
                 continue
             print(f"ERROR: Failed after {MAX_RETRIES} attempts: {url}: {e}", file=sys.stderr)
             return None, None, False
         except (URLError, TimeoutError, OSError) as e:
             if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY * (2 ** attempt))
+                time.sleep(RETRY_DELAY * (2**attempt))
                 continue
             print(f"ERROR: Failed after {MAX_RETRIES} attempts: {url}: {e}", file=sys.stderr)
             return None, None, False
     return None, None, False
 
 
-def fetch_etag_with_retry(
-    url: str, timeout: int = 30
-) -> tuple[str | None, bool]:
+def fetch_etag_with_retry(url: str, timeout: int = 30) -> tuple[str | None, bool]:
     """Fetch only response headers. Returns (ETag, request_succeeded)."""
     for attempt in range(MAX_RETRIES):
         req = Request(
@@ -186,7 +183,7 @@ def fetch_etag_with_retry(
             if e.code == 404:
                 return None, True
             if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY * (2 ** attempt))
+                time.sleep(RETRY_DELAY * (2**attempt))
                 continue
             print(
                 f"ERROR: HEAD failed after {MAX_RETRIES} attempts: {url}: {e}",
@@ -195,7 +192,7 @@ def fetch_etag_with_retry(
             return None, False
         except (URLError, TimeoutError, OSError) as e:
             if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY * (2 ** attempt))
+                time.sleep(RETRY_DELAY * (2**attempt))
                 continue
             print(
                 f"ERROR: HEAD failed after {MAX_RETRIES} attempts: {url}: {e}",
@@ -213,8 +210,8 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -224,8 +221,7 @@ def save_cache(cache: dict) -> None:
         f.write("\n")
 
 
-def write_file(path: str, content: str, args: argparse.Namespace, label: str,
-               is_new: bool) -> None:
+def write_file(path: str, content: str, args: argparse.Namespace, label: str, is_new: bool) -> None:
     """Write content to a file, respecting dry-run and verbose flags."""
     if args.dry_run:
         print(f"  {'ADD' if is_new else 'UPDATE'} {label}")
@@ -237,18 +233,14 @@ def write_file(path: str, content: str, args: argparse.Namespace, label: str,
             print(f"  {'ADD' if is_new else 'UPDATE'} {label}")
 
 
-def cache_check(cache: dict, new_cache: dict, cache_key: str,
-                content_hash: str, file_path: str) -> str:
+def cache_check(cache: dict, new_cache: dict, cache_key: str, content_hash: str, file_path: str) -> str:
     """Check cache status. Returns 'unchanged', 'new', or 'updated'."""
-    if (
-        cache.get(cache_key, {}).get("sha256") == content_hash
-        and os.path.exists(file_path)
-    ):
+    if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(file_path):
         new_cache[cache_key] = cache[cache_key]
         return "unchanged"
     new_cache[cache_key] = {
         "sha256": content_hash,
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": datetime.now(UTC).isoformat(),
     }
     if cache_key not in cache or not os.path.exists(file_path):
         return "new"
@@ -272,9 +264,7 @@ def resolve_ref(ref: str, spec: dict) -> dict:
     return node
 
 
-def schema_to_markdown(
-    schema: dict, spec: dict, depth: int = 0, seen: set | None = None
-) -> str:
+def schema_to_markdown(schema: dict, spec: dict, depth: int = 0, seen: set | None = None) -> str:
     if seen is None:
         seen = set()
 
@@ -450,9 +440,7 @@ def format_responses(responses: dict, spec: dict) -> str:
     return "\n".join(lines)
 
 
-def build_endpoint_markdown(
-    path: str, method: str, operation: dict, spec: dict
-) -> str:
+def build_endpoint_markdown(path: str, method: str, operation: dict, spec: dict) -> str:
     lines = []
 
     summary = operation.get("summary", f"{method.upper()} {path}")
@@ -531,11 +519,38 @@ class MadCapExtractor(html.parser.HTMLParser):
     """Extracts main content from a MadCap Flare page and converts to markdown."""
 
     BLOCK_TAGS = {
-        "p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
-        "ul", "ol", "li", "pre", "blockquote", "table", "thead",
-        "tbody", "tr", "th", "td", "hr", "br", "figure", "figcaption",
-        "details", "summary", "section", "article", "header", "footer",
-        "dl", "dt", "dd",
+        "p",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "pre",
+        "blockquote",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "th",
+        "td",
+        "hr",
+        "br",
+        "figure",
+        "figcaption",
+        "details",
+        "summary",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "dl",
+        "dt",
+        "dd",
     }
     INLINE_TAGS = {"a", "strong", "b", "em", "i", "code", "span", "img", "sup", "sub", "mark"}
     SKIP_TAGS = {"script", "style", "nav", "svg", "button", "iframe", "noscript"}
@@ -574,18 +589,17 @@ class MadCapExtractor(html.parser.HTMLParser):
             return
 
         # Detect the main content area -- MadCap Flare uses various IDs/classes
-        if not self._in_content:
-            if (
-                tag_id == "mc-main-content"
-                or (tag == "div" and "mc-body" in cls)
-                or (tag == "div" and "body-container" in cls)
-                or (tag == "div" and "okta-topics" in cls)
-                or (tag == "div" and "topic-content" in cls)
-                or attr_dict.get("data-mc-content-body") == "True"
-            ):
-                self._in_content = True
-                self._content_depth = 1
-                return
+        if not self._in_content and (
+            tag_id == "mc-main-content"
+            or (tag == "div" and "mc-body" in cls)
+            or (tag == "div" and "body-container" in cls)
+            or (tag == "div" and "okta-topics" in cls)
+            or (tag == "div" and "topic-content" in cls)
+            or attr_dict.get("data-mc-content-body") == "True"
+        ):
+            self._in_content = True
+            self._content_depth = 1
+            return
 
         if not self._in_content:
             return
@@ -610,9 +624,16 @@ class MadCapExtractor(html.parser.HTMLParser):
             return
 
         skip_classes = [
-            "replace_top_nav", "is-not-in-mobile", "oie-label",
-            "footer2", "footer", "breadcrumbs", "pagination-nav",
-            "navbar", "sidebar", "feedback",
+            "replace_top_nav",
+            "is-not-in-mobile",
+            "oie-label",
+            "footer2",
+            "footer",
+            "breadcrumbs",
+            "pagination-nav",
+            "navbar",
+            "sidebar",
+            "feedback",
         ]
         if any(sc in cls.lower() for sc in skip_classes):
             self._skip_depth = 1
@@ -883,7 +904,11 @@ class MadCapExtractor(html.parser.HTMLParser):
 
         elif tag == "div":
             # Check for note div ending
-            if self._tag_stack and self._tag_stack[-1].get("tag") == "div" and self._tag_stack[-1].get("is_note"):
+            if (
+                self._tag_stack
+                and self._tag_stack[-1].get("tag") == "div"
+                and self._tag_stack[-1].get("is_note")
+            ):
                 self._flush_line()
                 self._output.append("")
                 self._tag_stack.pop()
@@ -933,10 +958,18 @@ class MadCapExtractor(html.parser.HTMLParser):
 
     def handle_entityref(self, name: str):
         entities = {
-            "amp": "&", "lt": "<", "gt": ">", "quot": '"',
-            "apos": "'", "nbsp": " ", "mdash": "\u2014", "ndash": "\u2013",
-            "lsquo": "\u2018", "rsquo": "\u2019",
-            "ldquo": "\u201c", "rdquo": "\u201d",
+            "amp": "&",
+            "lt": "<",
+            "gt": ">",
+            "quot": '"',
+            "apos": "'",
+            "nbsp": " ",
+            "mdash": "\u2014",
+            "ndash": "\u2013",
+            "lsquo": "\u2018",
+            "rsquo": "\u2019",
+            "ldquo": "\u201c",
+            "rdquo": "\u201d",
         }
         char = entities.get(name, f"&{name};")
         if self._in_code_block:
@@ -948,10 +981,7 @@ class MadCapExtractor(html.parser.HTMLParser):
 
     def handle_charref(self, name: str):
         try:
-            if name.startswith("x"):
-                char = chr(int(name[1:], 16))
-            else:
-                char = chr(int(name))
+            char = chr(int(name[1:], 16)) if name.startswith("x") else chr(int(name))
         except (ValueError, OverflowError):
             char = f"&#{name};"
         if self._in_code_block:
@@ -1049,13 +1079,15 @@ def sync_api_spec(
             for tag in tags:
                 if tag not in endpoints_by_tag:
                     endpoints_by_tag[tag] = []
-                endpoints_by_tag[tag].append({
-                    "path": path,
-                    "method": method,
-                    "summary": summary,
-                    "filename": filename,
-                    "operation": operation,
-                })
+                endpoints_by_tag[tag].append(
+                    {
+                        "path": path,
+                        "method": method,
+                        "summary": summary,
+                        "filename": filename,
+                        "operation": operation,
+                    }
+                )
 
     added = 0
     updated = 0
@@ -1162,9 +1194,7 @@ def sync_api_spec(
     return added, updated, unchanged, removed
 
 
-def sync_api(
-    cache: dict, new_cache: dict, args: argparse.Namespace
-) -> tuple[int, int, int, int]:
+def sync_api(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple[int, int, int, int]:
     """Fetch and sync all three Okta OpenAPI specs. Returns (added, updated, unchanged, removed)."""
     total_added = 0
     total_updated = 0
@@ -1176,10 +1206,7 @@ def sync_api(
     print(f"  Fetching {len(API_SPECS)} specs concurrently...")
     raw_specs: dict[str, str | None] = {}
     with ThreadPoolExecutor(max_workers=len(API_SPECS)) as pool:
-        futures = {
-            pool.submit(fetch_url, info["url"]): key
-            for key, info in API_SPECS.items()
-        }
+        futures = {pool.submit(fetch_url, info["url"]): key for key, info in API_SPECS.items()}
         for future in as_completed(futures):
             raw_specs[futures[future]] = future.result()
 
@@ -1210,9 +1237,7 @@ def sync_api(
             with open(spec_path, "w", encoding="utf-8") as f:
                 f.write(raw_yaml_content)
 
-        a, u, uc, r = sync_api_spec(
-            spec_key, spec_info, raw_yaml_content, spec, cache, new_cache, args
-        )
+        a, u, uc, r = sync_api_spec(spec_key, spec_info, raw_yaml_content, spec, cache, new_cache, args)
         print(f"    {spec_info['name']}: +{a} ~{u} ={uc} -{r}")
 
         total_added += a
@@ -1220,11 +1245,13 @@ def sync_api(
         total_unchanged += uc
         total_removed += r
 
-        spec_summaries.append((
-            spec_key,
-            info.get("title", spec_info["name"]),
-            info.get("description", ""),
-        ))
+        spec_summaries.append(
+            (
+                spec_key,
+                info.get("title", spec_info["name"]),
+                info.get("description", ""),
+            )
+        )
 
     # Build top-level api/ README
     api_readme_lines = ["# Okta REST API Documentation\n"]
@@ -1272,7 +1299,7 @@ def fetch_all_help_pages() -> dict[str, str]:
         url = loc.text.strip()
         if not url.startswith(prefix + "/"):
             continue
-        path = url[len(prefix):]
+        path = url[len(prefix) :]
         if path.lower().endswith((".htm", ".html")):
             # Titles are extracted from each page's <title>/<h1>.
             pages[path] = ""
@@ -1291,9 +1318,7 @@ def sanitize_help_path(url_path: str) -> str:
     return path
 
 
-def sync_help(
-    cache: dict, new_cache: dict, args: argparse.Namespace
-) -> tuple[int, int, int, int]:
+def sync_help(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple[int, int, int, int]:
     """Fetch and sync Okta help documentation. Returns (added, updated, unchanged, removed)."""
     try:
         all_pages = fetch_all_help_pages()
@@ -1315,7 +1340,7 @@ def sync_help(
     if args.dry_run:
         print(f"  {len(pages_list)} help pages would be fetched")
         # Still mark them in new_cache for removal tracking
-        for url_path, title in pages_list:
+        for url_path, _title in pages_list:
             clean_path = sanitize_help_path(url_path)
             parts = clean_path.split("/")
             filename = parts[-1] + ".md"
@@ -1338,9 +1363,7 @@ def sync_help(
     completed = [0]  # Use list for mutability in closure
     lock_print = __import__("threading").Lock()
 
-    def process_page(
-        url_path: str, title: str
-    ) -> tuple[str, str, str, str, str, str, str, str | None]:
+    def process_page(url_path: str, title: str) -> tuple[str, str, str, str, str, str, str, str | None]:
         """Fetch and process a single help page."""
         clean_path = sanitize_help_path(url_path)
         parts = clean_path.split("/")
@@ -1348,10 +1371,7 @@ def sync_help(
         subdir = "/".join(parts[:-1]) if len(parts) > 1 else ""
         cache_key = f"help:{subdir}/{filename}" if subdir else f"help:{filename}"
 
-        if subdir:
-            target_dir = os.path.join(HELP_DOCS_DIR, subdir)
-        else:
-            target_dir = HELP_DOCS_DIR
+        target_dir = os.path.join(HELP_DOCS_DIR, subdir) if subdir else HELP_DOCS_DIR
         file_path = os.path.join(target_dir, filename)
         label = f"help/{subdir}/{filename}" if subdir else f"help/{filename}"
         previous = cache.get(cache_key, {})
@@ -1365,39 +1385,58 @@ def sync_help(
             head_etag, head_succeeded = fetch_etag_with_retry(url)
             if head_succeeded and head_etag == request_etag:
                 return (
-                    "unchanged", cache_key, "", file_path, label, "",
-                    display_title, head_etag,
+                    "unchanged",
+                    cache_key,
+                    "",
+                    file_path,
+                    label,
+                    "",
+                    display_title,
+                    head_etag,
                 )
-        raw_html, response_etag, not_modified = fetch_url_with_retry(
-            url, etag=request_etag)
+        raw_html, response_etag, not_modified = fetch_url_with_retry(url, etag=request_etag)
         if not_modified:
             return (
-                "unchanged", cache_key, "", file_path, label, "",
-                display_title, response_etag,
+                "unchanged",
+                cache_key,
+                "",
+                file_path,
+                label,
+                "",
+                display_title,
+                response_etag,
             )
 
         if not raw_html:
             return (
-                "failed", cache_key, "", file_path, label, "",
-                display_title, None,
+                "failed",
+                cache_key,
+                "",
+                file_path,
+                label,
+                "",
+                display_title,
+                None,
             )
 
         page_title, markdown = html_to_markdown(raw_html)
         if not markdown.strip() or len(markdown.strip()) < 50:
             return (
-                "skipped", cache_key, "", file_path, label, "",
-                display_title, response_etag,
+                "skipped",
+                cache_key,
+                "",
+                file_path,
+                label,
+                "",
+                display_title,
+                response_etag,
             )
 
         # Build full page content with header. The DITA article usually repeats
         # its title as an h1, which would otherwise duplicate our stable header.
         display_title = title or page_title or filename.replace(".md", "")
         markdown_lines = markdown.lstrip().splitlines()
-        if (
-            markdown_lines
-            and markdown_lines[0].strip().casefold()
-            == f"# {display_title}".casefold()
-        ):
+        if markdown_lines and markdown_lines[0].strip().casefold() == f"# {display_title}".casefold():
             markdown = "\n".join(markdown_lines[1:]).lstrip()
         content = f"# {display_title}\n\n"
         content += f"**Source:** {HELP_BASE_URL}{url_path}\n\n"
@@ -1406,8 +1445,14 @@ def sync_help(
 
         content_hash = sha256(content)
         return (
-            "ok", cache_key, content_hash, file_path, label, content,
-            display_title, response_etag,
+            "ok",
+            cache_key,
+            content_hash,
+            file_path,
+            label,
+            content,
+            display_title,
+            response_etag,
         )
 
     # Process pages concurrently
@@ -1421,8 +1466,14 @@ def sync_help(
             url_path, title = futures[future]
             try:
                 (
-                    status, cache_key, content_hash, file_path, label, content,
-                    display_title, response_etag,
+                    status,
+                    cache_key,
+                    content_hash,
+                    file_path,
+                    label,
+                    content,
+                    display_title,
+                    response_etag,
                 ) = future.result()
             except Exception as e:
                 print(f"    ERROR processing {url_path}: {e}", file=sys.stderr)
@@ -1436,12 +1487,9 @@ def sync_help(
             subdir = "/".join(parts[:-1]) if len(parts) > 1 else ""
             section = parts[0] if len(parts) > 1 else "root"
 
-            preserve_existing = (
-                cache_key in cache and os.path.exists(file_path)
-            )
+            preserve_existing = cache_key in cache and os.path.exists(file_path)
             if status in ("ok", "unchanged") or preserve_existing:
-                sections.setdefault(section, []).append(
-                    (filename, display_title, url_path))
+                sections.setdefault(section, []).append((filename, display_title, url_path))
 
             if status == "failed":
                 failed += 1
@@ -1485,10 +1533,7 @@ def sync_help(
             completed[0] += 1
             if completed[0] % 50 == 0 or completed[0] == total:
                 with lock_print:
-                    print(
-                        f"    [{completed[0]}/{total}] +{added} ~{updated} "
-                        f"={unchanged} failed:{failed}"
-                    )
+                    print(f"    [{completed[0]}/{total}] +{added} ~{updated} ={unchanged} failed:{failed}")
 
     # Build section README indexes
     for section, pages in sorted(sections.items()):
@@ -1520,9 +1565,7 @@ def sync_help(
 
     # Top-level help/ README
     help_readme_lines = ["# Okta Help Documentation\n"]
-    help_readme_lines.append(
-        "Complete Okta admin documentation scraped from help.okta.com.\n"
-    )
+    help_readme_lines.append("Complete Okta admin documentation scraped from help.okta.com.\n")
     total_pages = sum(len(p) for p in sections.values())
     help_readme_lines.append(f"**Total pages:** {total_pages}\n")
     help_readme_lines.append("## Sections\n")
@@ -1564,7 +1607,7 @@ def sync_help(
 
     # Clean empty dirs
     if not args.dry_run and os.path.isdir(HELP_DOCS_DIR):
-        for root, dirs, files in os.walk(HELP_DOCS_DIR, topdown=False):
+        for root, dirs, _files in os.walk(HELP_DOCS_DIR, topdown=False):
             for d in dirs:
                 dir_path = os.path.join(root, d)
                 try:
@@ -1616,7 +1659,7 @@ def sync(args: argparse.Namespace) -> None:
     total_unchanged = api_unchanged + help_unchanged
     total_removed = api_removed + help_removed
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:     {total_added}")
     print(f"  Updated:   {total_updated}")
     print(f"  Unchanged: {total_unchanged}")
@@ -1624,9 +1667,7 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fetch Okta API and help docs, convert to markdown"
-    )
+    parser = argparse.ArgumentParser(description="Fetch Okta API and help docs, convert to markdown")
     parser.add_argument(
         "--dry-run",
         action="store_true",

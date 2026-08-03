@@ -35,7 +35,8 @@ import posixpath
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -45,8 +46,7 @@ CONTENT_PREFIX = "docs/content/"
 DATA_PREFIX = "docs/data/"
 SITE = "https://www.authelia.com"
 
-SECTIONS = ("overview", "configuration", "integration", "contributing",
-            "blog", "roadmap", "reference")
+SECTIONS = ("overview", "configuration", "integration", "contributing", "blog", "roadmap", "reference")
 
 TREE_URL = f"https://api.github.com/repos/{REPO}/git/trees/{BRANCH}?recursive=1"
 RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
@@ -74,7 +74,7 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -90,8 +90,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -151,11 +151,10 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
             list_key = key
         elif value.startswith("[") and value.endswith("]"):
             inner = value[1:-1].strip()
-            meta[key] = ([v.strip().strip("'\"") for v in inner.split(",")]
-                         if inner else [])
+            meta[key] = [v.strip().strip("'\"") for v in inner.split(",")] if inner else []
         else:
             meta[key] = value.strip("'\"")
-    return meta, text[m.end():]
+    return meta, text[m.end() :]
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +168,8 @@ def parse_attrs(s: str) -> dict[str, str]:
     return dict(ATTR_RE.findall(s))
 
 
-SC = r"\{\{[<%]\s*"   # shortcode open
-CS = r"\s*[%>]\}\}"   # shortcode close
+SC = r"\{\{[<%]\s*"  # shortcode open
+CS = r"\s*[%>]\}\}"  # shortcode close
 
 PRINT_RE = re.compile(SC + r'print\s+"((?:[^"\\]|\\.)*)"' + CS)
 SITEVAR_RE = re.compile(SC + r"sitevar\s+([^>%]*?)" + CS)
@@ -191,11 +190,9 @@ TAB_CLOSE_RE = re.compile(SC + r"/(?:envTab|sessionTab)" + CS)
 DETAILS_OPEN_RE = re.compile(SC + r'details\s+"([^"]+)"(?:\s+"[^"]*")?' + CS)
 DETAILS_CLOSE_RE = re.compile(SC + r"/details" + CS)
 
-FIGURE_ML_RE = re.compile(SC + r"(figure|picture|inline-svg)\b(.*?)" + CS,
-                          re.DOTALL)
+FIGURE_ML_RE = re.compile(SC + r"(figure|picture|inline-svg)\b(.*?)" + CS, re.DOTALL)
 OIDC_COMMON_RE = re.compile(SC + r"oidc-common\b([^>%]*?)" + CS)
-OIDC_ESCAPE_RE = re.compile(
-    SC + r"oidc-escape-hatch-claims-hydration\b([^>%]*?)" + CS)
+OIDC_ESCAPE_RE = re.compile(SC + r"oidc-escape-hatch-claims-hydration\b([^>%]*?)" + CS)
 CONFIG_ALERT_RE = re.compile(SC + r"config-alert-example" + CS)
 SITEVAR_PREFS_RE = re.compile(SC + r"sitevar-preferences" + CS)
 CSP_RE = re.compile(SC + r"csp" + CS)
@@ -208,18 +205,26 @@ PBKDF2_VARIANTS_RE = re.compile(SC + r"hashing-pbkdf2-variants" + CS)
 SUPPORTED_PRODUCT_RE = re.compile(SC + r"supported-product\b([^>%]*?)" + CS)
 
 FENCE_RE = re.compile(r"^\s*(`{3,})")
-FENCE_TITLE_RE = re.compile(
-    r'^(\s*)(`{3,})([A-Za-z0-9_+-]*)\s*\{\s*title\s*=\s*"?([^"}]+?)"?\s*\}\s*$')
+FENCE_TITLE_RE = re.compile(r'^(\s*)(`{3,})([A-Za-z0-9_+-]*)\s*\{\s*title\s*=\s*"?([^"}]+?)"?\s*\}\s*$')
 CODE_SPAN_RE = re.compile(r"(`+)[^`]*?\1")
 LEFTOVER_RE = re.compile(r"\{\{[<%]")
 
-ALERT_KIND = {"note": "NOTE", "tip": "TIP", "caution": "WARNING",
-              "danger": "CAUTION", "warning": "WARNING", "info": "NOTE"}
-SUPPORT_TEXT = {"full": "Full", "partial": "Partial", "legacy": "Legacy",
-                "unknown": "Unknown"}
-ROADMAP_TEXT = {"in-progress": "in progress", "needs-design": "needs design",
-                "waiting": "waiting", "complete": "complete",
-                "abandoned": "abandoned"}
+ALERT_KIND = {
+    "note": "NOTE",
+    "tip": "TIP",
+    "caution": "WARNING",
+    "danger": "CAUTION",
+    "warning": "WARNING",
+    "info": "NOTE",
+}
+SUPPORT_TEXT = {"full": "Full", "partial": "Partial", "legacy": "Legacy", "unknown": "Unknown"}
+ROADMAP_TEXT = {
+    "in-progress": "in progress",
+    "needs-design": "needs design",
+    "waiting": "waiting",
+    "complete": "complete",
+    "abandoned": "abandoned",
+}
 
 CONFIG_ALERT_LINES = [
     "> [!NOTE]",
@@ -242,8 +247,7 @@ def mask_code_spans(line: str) -> str:
 def render_confkey(attrs: dict[str, str]) -> str:
     parts: list[str] = []
     ctype = attrs.get("type", "string")
-    parts.append("Type: " + " or ".join(f"`{t.strip()}`"
-                                        for t in ctype.split(",") if t.strip()))
+    parts.append("Type: " + " or ".join(f"`{t.strip()}`" for t in ctype.split(",") if t.strip()))
     syntax = attrs.get("syntax", "")
     structure = attrs.get("structure", "")
     ref = attrs.get("common", "")
@@ -262,14 +266,15 @@ def render_confkey(attrs: dict[str, str]) -> str:
         parts.append(f"Structure: [{structure}]({common_url}{ref or structure})")
     if "default" in attrs:
         parts.append(f"Default: `{attrs['default']}`")
-    required = {"no": "no", "situational": "situational"}.get(
-        attrs.get("required"), "yes")
+    required = {"no": "no", "situational": "situational"}.get(attrs.get("required", ""), "yes")
     parts.append(f"Required: {required}")
     line = "*" + " | ".join(parts) + "*"
     if attrs.get("secret") == "yes":
-        line += ("\n\n*This option can also be defined using a "
-                 "[secret](/configuration/methods/secrets/) which is "
-                 "strongly recommended.*")
+        line += (
+            "\n\n*This option can also be defined using a "
+            "[secret](/configuration/methods/secrets/) which is "
+            "strongly recommended.*"
+        )
     return line
 
 
@@ -311,7 +316,8 @@ OIDC_BUG_NOTES = {
         f"[OpenID Connect 1.0]({OIDC_CORE}) as it does not honor the expected "
         "process to retrieve the claims it needs to access. The workaround is "
         "documented in "
-        "[Configuration Escape Hatch](#configuration-escape-hatch)."),
+        "[Configuration Escape Hatch](#configuration-escape-hatch)."
+    ),
     "client-credentials-encoding": (
         "> **Client Credentials Encoding:** this client does not properly "
         "encode the client credentials before using them for authentication "
@@ -324,7 +330,8 @@ OIDC_BUG_NOTES = {
         "them before adding them to the clients configuration are the only "
         "workarounds. Authelia's random password generator will "
         "automatically output both a normal version and a pre-encoded "
-        "version which you could utilize."),
+        "version which you could utilize."
+    ),
     "claim-binding": (
         f"> **Claim Binding:** this client outright does not support "
         f"[OpenID Connect 1.0]({OIDC_CORE}) as it does not bind the identity "
@@ -334,7 +341,8 @@ OIDC_BUG_NOTES = {
         "could result in a simple privilege escalation. The developer has "
         "been made aware of this vulnerability but has decided not to fix "
         "it. See [OpenID Connect 1.0 Section 5.7 Claim Stability and "
-        f"Uniqueness]({OIDC_CORE}#ClaimStability) for more information."),
+        f"Uniqueness]({OIDC_CORE}#ClaimStability) for more information."
+    ),
 }
 
 
@@ -426,8 +434,7 @@ def render_oidc_common(attrs: dict[str, str]) -> list[str]:
 def render_oidc_escape_hatch(attrs: dict[str, str]) -> list[str]:
     client_id = attrs.get("client_id") or "example"
     policy = attrs.get("policy_name") or client_id
-    claims = attrs.get("claims") or ("rat,groups,email,email_verified,"
-                                     "alt_emails,preferred_username,name")
+    claims = attrs.get("claims") or ("rat,groups,email,email_verified,alt_emails,preferred_username,name")
     lines = [
         "> [!TIP]",
         "> **Potential Escape Hatch Configuration Required**",
@@ -449,7 +456,7 @@ def render_oidc_escape_hatch(attrs: dict[str, str]) -> list[str]:
         f"Scope Values]({OIDC_CORE}#ScopeClaims) with the exception of an "
         "Implicit Flow that does not return an Access Token, or explicitly "
         "request them via the claims parameter as described by "
-        "[5.5. Requesting Claims using the \"claims\" Request Parameter]"
+        '[5.5. Requesting Claims using the "claims" Request Parameter]'
         f"({OIDC_CORE}#ClaimsParameter).",
         ">",
         "> The requirement to use this option is also often a clear "
@@ -485,8 +492,7 @@ def render_oidc_escape_hatch(attrs: dict[str, str]) -> list[str]:
 
 
 def md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
-    lines = ["| " + " | ".join(headers) + " |",
-             "|" + "|".join("---" for _ in headers) + "|"]
+    lines = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
     for row in rows:
         lines.append("| " + " | ".join(row) + " |")
     return lines
@@ -519,26 +525,39 @@ class Converter:
             return []
         if CSP_RE.fullmatch(s):
             csp = self.data.get("misc", {}).get("csp", {})
-            return [f"**Placeholder Value:** `{csp.get('nonce', '')}`",
-                    "",
-                    f"**Default Template:** `{csp.get('default', '')}`"]
+            return [
+                f"**Placeholder Value:** `{csp.get('nonce', '')}`",
+                "",
+                f"**Default Template:** `{csp.get('default', '')}`",
+            ]
         m = TABLE_CONFIG_KEYS_RE.fullmatch(s)
         if m:
             secrets = parse_attrs(m.group(1)).get("secrets") == "true"
             keys = self.data.get("configkeys", [])
-            rows = [[f"`{e['path']}`", f"`{e['env']}`"]
-                    for e in keys if bool(e.get("secret")) == secrets]
+            rows = [[f"`{e['path']}`", f"`{e['env']}`"] for e in keys if bool(e.get("secret")) == secrets]
             return md_table(["Configuration Key", "Environment Variable"], rows)
         if TABLE_I18N_LOCALES_RE.fullmatch(s):
             langs = self.data.get("languages", {}).get("languages", [])
-            rows = [[l.get("display", ""), l.get("locale", ""),
-                     ", ".join(l.get("namespaces", [])),
-                     ", ".join(l.get("fallbacks", []))] for l in langs]
+            rows = [
+                [
+                    language.get("display", ""),
+                    language.get("locale", ""),
+                    ", ".join(language.get("namespaces", [])),
+                    ", ".join(language.get("fallbacks", [])),
+                ]
+                for language in langs
+            ]
             return md_table(["Language", "Locale", "Namespaces", "Fallbacks"], rows)
         if TABLE_I18N_OVERRIDES_RE.fullmatch(s):
             langs = self.data.get("languages", {}).get("languages", [])
-            rows = [[l.get("display", ""), l.get("locale", ""),
-                     f"`locales/{l.get('locale', '')}/*.json`"] for l in langs]
+            rows = [
+                [
+                    language.get("display", ""),
+                    language.get("locale", ""),
+                    f"`locales/{language.get('locale', '')}/*.json`",
+                ]
+                for language in langs
+            ]
             return md_table(["Language", "Locale", "Override Path"], rows)
         if TABLE_TOTP_RE.fullmatch(s):
             apps = self.data.get("support", {}).get("totp", [])
@@ -546,30 +565,37 @@ class Converter:
             for a in apps:
                 alg = a.get("algorithms", {})
                 dig = a.get("digits", {})
-                yn = lambda v: "Yes" if v else "No"
-                rows.append([f"[{a.get('name', '')}]({a.get('url', '')})",
-                             yn(alg.get("SHA1")), yn(alg.get("SHA256")),
-                             yn(alg.get("SHA512")),
-                             yn(dig.get("six")), yn(dig.get("eight"))])
-            return md_table(["Application", "SHA1", "SHA256", "SHA512",
-                             "6 digits", "8 digits"], rows)
-        variants = (self.data.get("misc", {})
-                    .get("hashing_algorithms", {})
-                    .get("pbkdf2", {}).get("variants", {}))
+
+                def yn(v):
+                    return "Yes" if v else "No"
+
+                rows.append(
+                    [
+                        f"[{a.get('name', '')}]({a.get('url', '')})",
+                        yn(alg.get("SHA1")),
+                        yn(alg.get("SHA256")),
+                        yn(alg.get("SHA512")),
+                        yn(dig.get("six")),
+                        yn(dig.get("eight")),
+                    ]
+                )
+            return md_table(["Application", "SHA1", "SHA256", "SHA512", "6 digits", "8 digits"], rows)
+        variants = (
+            self.data.get("misc", {}).get("hashing_algorithms", {}).get("pbkdf2", {}).get("variants", {})
+        )
         if PBKDF2_ITER_RE.fullmatch(s):
-            rows = [[f"`{v}`", str(d.get("default_iterations", ""))]
-                    for v, d in variants.items()]
+            rows = [[f"`{v}`", str(d.get("default_iterations", ""))] for v, d in variants.items()]
             return md_table(["Variant", "Default Iterations"], rows)
         if PBKDF2_VARIANTS_RE.fullmatch(s):
-            rows = [[f"`{v}`", str(d.get("fips", "")),
-                     str(d.get("default_iterations", ""))]
-                    for v, d in variants.items()]
+            rows = [
+                [f"`{v}`", str(d.get("fips", "")), str(d.get("default_iterations", ""))]
+                for v, d in variants.items()
+            ]
             return md_table(["Variant", "FIPS 140", "Iterations"], rows)
         m = SUPPORTED_PRODUCT_RE.fullmatch(s)
         if m:
             attrs = parse_attrs(m.group(1))
-            versions = (self.data.get("misc", {}).get("support", {})
-                        .get(attrs.get("product", ""), []))
+            versions = self.data.get("misc", {}).get("support", {}).get(attrs.get("product", ""), [])
             fmt = attrs.get("format", "$version")
             return [fmt.replace("$version", str(v)) for v in versions]
         return None
@@ -610,13 +636,10 @@ class Converter:
 
         # Global substitutions, applied inside code fences too (config
         # examples and shell commands rely on them).
-        text = SITEVAR_RE.sub(
-            lambda m: parse_attrs(m.group(1)).get("nojs", ""), text)
+        text = SITEVAR_RE.sub(lambda m: parse_attrs(m.group(1)).get("nojs", ""), text)
         text = LATEST_RE.sub(self.latest, text)
         # figure/picture calls sometimes spread attributes across lines.
-        text = FIGURE_ML_RE.sub(
-            lambda m: render_figure(m.group(1), parse_attrs(m.group(2)), page),
-            text)
+        text = FIGURE_ML_RE.sub(lambda m: render_figure(m.group(1), parse_attrs(m.group(2)), page), text)
 
         out: list[str] = []
         lines = text.split("\n")
@@ -633,14 +656,17 @@ class Converter:
                 out.extend(chunk)
 
         def flush_callout() -> None:
-            body_lines = callout["lines"]
+            current = callout
+            if current is None:
+                return
+            body_lines = current["lines"]
             while body_lines and not body_lines[0].strip():
                 body_lines.pop(0)
             while body_lines and not body_lines[-1].strip():
                 body_lines.pop()
-            quoted = [f"> [!{callout['kind']}]"]
-            if callout["title"]:
-                quoted.append(f"> **{callout['title']}**")
+            quoted = [f"> [!{current['kind']}]"]
+            if current["title"]:
+                quoted.append(f"> **{current['title']}**")
                 quoted.append(">")
             for bl in body_lines:
                 quoted.append(f"> {bl}".rstrip())
@@ -653,8 +679,7 @@ class Converter:
             if in_fence:
                 emit(line)
                 fm = FENCE_RE.match(line)
-                if fm and line.strip() == fm.group(1) and \
-                        len(fm.group(1)) >= len(fence_marker):
+                if fm and line.strip() == fm.group(1) and len(fm.group(1)) >= len(fence_marker):
                     in_fence = False
                 continue
 
@@ -676,20 +701,23 @@ class Converter:
 
             m = CALLOUT_OPEN_RE.search(masked)
             if m and callout is None:
-                pre = line[:m.start()].rstrip()
+                pre = line[: m.start()].rstrip()
                 if pre:
                     emit(pre)
-                attrs = parse_attrs(line[m.start():m.end()])
-                callout = {"kind": ALERT_KIND.get(attrs.get("context", ""), "NOTE"),
-                           "title": attrs.get("title", ""), "lines": []}
-                post = line[m.end():].strip()
+                attrs = parse_attrs(line[m.start() : m.end()])
+                callout = {
+                    "kind": ALERT_KIND.get(attrs.get("context", ""), "NOTE"),
+                    "title": attrs.get("title", ""),
+                    "lines": [],
+                }
+                post = line[m.end() :].strip()
                 if post:
                     callout["lines"].append(post)
                 continue
             m = CALLOUT_CLOSE_RE.search(masked)
             if m and callout is not None:
-                post = line[m.end():].strip()
-                pre = line[:m.start()].strip()
+                post = line[m.end() :].strip()
+                pre = line[: m.start()].strip()
                 if pre:
                     callout["lines"].append(pre)
                 flush_callout()
@@ -702,7 +730,7 @@ class Converter:
                 continue
             tm = TAB_OPEN_RE.fullmatch(masked.strip())
             if tm:
-                label = TAB_OPEN_RE.fullmatch(line.strip()).group(1)
+                label = tm.group(1)
                 emit(f"**{label}**")
                 emit("")
                 continue
@@ -711,7 +739,7 @@ class Converter:
                 continue
             dm = DETAILS_OPEN_RE.fullmatch(masked.strip())
             if dm:
-                label = DETAILS_OPEN_RE.fullmatch(line.strip()).group(1)
+                label = dm.group(1)
                 emit(f"**{label}**")
                 emit("")
                 continue
@@ -742,13 +770,12 @@ class Converter:
 
     LINK_RE = re.compile(r"(!?)\[([^\]]*)\]\(([^()\s]+)\)")
     REFDEF_RE = re.compile(r"^(\s{0,3}\[[^\]]+\]:\s*)(\S+)(.*)$")
-    ASSET_EXT_RE = re.compile(
-        r"\.(png|jpe?g|gif|webp|svg|ico|pdf|ya?ml|json|txt|zip|tar\.gz)$", re.I)
+    ASSET_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg|ico|pdf|ya?ml|json|txt|zip|tar\.gz)$", re.I)
 
     def map_target(self, target: str, page: dict) -> str | None:
         """Return a replacement link target, or None to leave it alone."""
         if target.startswith(SITE):
-            rest = target[len(SITE):] or "/"
+            rest = target[len(SITE) :] or "/"
             mapped = self.map_target(rest, page)
             return mapped
         if target.startswith(("http://", "https://", "mailto:", "tel:", "#")):
@@ -761,10 +788,8 @@ class Converter:
         if path.startswith("/"):
             key = path.strip("/")
         else:
-            bare_word = ("/" not in path and not path.endswith(".md")
-                         and not path.startswith("."))
-            key = posixpath.normpath(
-                posixpath.join(page["link_base"], path)).strip("/")
+            bare_word = "/" not in path and not path.endswith(".md") and not path.startswith(".")
+            key = posixpath.normpath(posixpath.join(page["link_base"], path)).strip("/")
             if key == ".":
                 key = ""
         url_key = key
@@ -795,7 +820,7 @@ class Converter:
         def repl(m: re.Match) -> str:
             mapped = self.map_target(m.group(3), page)
             if mapped is None:
-                return m.group(0)
+                return str(m.group(0))
             return f"{m.group(1)}[{m.group(2)}]({mapped})"
 
         def sub_line(line: str) -> str:
@@ -812,7 +837,7 @@ class Converter:
 
             def guarded(m: re.Match) -> str:
                 if any(s <= m.start() and m.end() <= e for s, e in spans):
-                    return m.group(0)
+                    return str(m.group(0))
                 return repl(m)
 
             return self.LINK_RE.sub(guarded, line)
@@ -848,6 +873,7 @@ class Converter:
 # Discovery and page model
 # ---------------------------------------------------------------------------
 
+
 def discover() -> tuple[list[str], str]:
     """Return content-relative paths and a hash of all relevant Git blobs."""
     print("Fetching repository tree...")
@@ -857,39 +883,39 @@ def discover() -> tuple[list[str], str]:
         sys.exit(1)
     data = json.loads(body)
     if data.get("truncated"):
-        print("WARNING: tree response truncated; some files may be missing",
-              file=sys.stderr)
+        print("WARNING: tree response truncated; some files may be missing", file=sys.stderr)
     rels = []
     manifest: list[tuple[str, str]] = []
     data_paths = {
-        f"{DATA_PREFIX}{name}"
-        for name in ("misc.json", "configkeys.json", "languages.json",
-                     "support.json")
+        f"{DATA_PREFIX}{name}" for name in ("misc.json", "configkeys.json", "languages.json", "support.json")
     }
     for t in data.get("tree", []):
         p = t.get("path", "")
         if t.get("type") == "blob" and p in data_paths:
             manifest.append((p, t.get("sha", "")))
-        if (t.get("type") != "blob" or not p.startswith(CONTENT_PREFIX)
-                or not p.endswith(".md")):
+        if t.get("type") != "blob" or not p.startswith(CONTENT_PREFIX) or not p.endswith(".md"):
             continue
-        rel = p[len(CONTENT_PREFIX):]
+        rel = p[len(CONTENT_PREFIX) :]
         if rel.split("/", 1)[0] in SECTIONS:
             rels.append(rel)
             manifest.append((p, t.get("sha", "")))
     with open(__file__, "rb") as f:
         fetcher_hash = hashlib.sha256(f.read()).hexdigest()
-    fingerprint = sha256(json.dumps({
-        "blobs": sorted(manifest),
-        "fetcher": fetcher_hash,
-    }, separators=(",", ":")))
+    fingerprint = sha256(
+        json.dumps(
+            {
+                "blobs": sorted(manifest),
+                "fetcher": fetcher_hash,
+            },
+            separators=(",", ":"),
+        )
+    )
     return sorted(rels), fingerprint
 
 
 def source_outputs_complete(source: dict) -> bool:
     outputs = source.get("outputs", [])
-    return bool(outputs) and all(
-        os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
+    return bool(outputs) and all(os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
 
 
 def hugo_urlize(title: str) -> str:
@@ -909,10 +935,7 @@ def page_from(rel: str, raw: str) -> dict:
     section = rel.split("/", 1)[0]
     is_index = posixpath.basename(base) == "_index"
     bundle = posixpath.basename(base) == "index"
-    if is_index or bundle:
-        url = posixpath.dirname(base)
-    else:
-        url = base
+    url = posixpath.dirname(base) if is_index or bundle else base
     natural_url = url
     title = meta.get("title", "") or posixpath.basename(url)
     slug = meta.get("slug")
@@ -926,7 +949,7 @@ def page_from(rel: str, raw: str) -> dict:
     try:
         weight = int(str(meta.get("weight", "")))
     except ValueError:
-        weight = 10 ** 9
+        weight = 10**9
     return {
         "rel": rel,
         "url": url,
@@ -967,21 +990,20 @@ def build_page_markdown(page: dict, conv: Converter) -> str:
 # Index generation
 # ---------------------------------------------------------------------------
 
+
 def sort_pages(pages: list[dict], section: str) -> list[dict]:
     if section == "blog":
         return sorted(pages, key=lambda p: (p["date"], p["title"]), reverse=True)
     return sorted(pages, key=lambda p: (p["weight"], p["title"].lower()))
 
 
-def build_section_readme(section: str, leaves: list[dict],
-                         indexes: dict[str, dict]) -> str:
+def build_section_readme(section: str, leaves: list[dict], indexes: dict[str, dict]) -> str:
     sec = indexes.get(section, {})
     title = sec.get("title") or section.title()
     lines = [f"# {title}", ""]
     if sec.get("description"):
         lines += [f"*{sec['description']}*", ""]
-    lines.append(f"*Mirrored from [{SITE}/{section}/]({SITE}/{section}/). "
-                 f"{len(leaves)} pages.*")
+    lines.append(f"*Mirrored from [{SITE}/{section}/]({SITE}/{section}/). {len(leaves)} pages.*")
     lines.append("")
 
     by_dir: dict[str, list[dict]] = {}
@@ -1001,13 +1023,13 @@ def build_section_readme(section: str, leaves: list[dict],
 
     def child_dirs(dir_url: str) -> list[str]:
         prefix = dir_url + "/"
-        kids = {d[len(prefix):].split("/")[0]
-                for d in by_dir if d.startswith(prefix)}
-        kids |= {d[len(prefix):].split("/")[0]
-                 for d in indexes if d.startswith(prefix) and d != dir_url}
+        kids = {d[len(prefix) :].split("/")[0] for d in by_dir if d.startswith(prefix)}
+        kids |= {d[len(prefix) :].split("/")[0] for d in indexes if d.startswith(prefix) and d != dir_url}
+
         def key(name: str) -> tuple:
             idx = indexes.get(posixpath.join(dir_url, name), {})
-            return (idx.get("weight", 10 ** 9), name)
+            return (idx.get("weight", 10**9), name)
+
         return sorted(kids, key=key)
 
     def walk(dir_url: str, depth: int) -> None:
@@ -1030,12 +1052,13 @@ def build_section_readme(section: str, leaves: list[dict],
     return "\n".join(lines) + "\n"
 
 
-def build_top_readme(by_section: dict[str, list[dict]],
-                     indexes: dict[str, dict]) -> str:
+def build_top_readme(by_section: dict[str, list[dict]], indexes: dict[str, dict]) -> str:
     lines = ["# Authelia Documentation", ""]
-    lines.append(f"*Mirrored from [{SITE}/]({SITE}/). Source: "
-                 f"[github.com/{REPO}](https://github.com/{REPO}) "
-                 f"`docs/content/` (branch `{BRANCH}`).*")
+    lines.append(
+        f"*Mirrored from [{SITE}/]({SITE}/). Source: "
+        f"[github.com/{REPO}](https://github.com/{REPO}) "
+        f"`docs/content/` (branch `{BRANCH}`).*"
+    )
     lines.append("")
     lines.append("## Sections")
     lines.append("")
@@ -1055,6 +1078,7 @@ def build_top_readme(by_section: dict[str, list[dict]],
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     # The previous cache is always loaded for removal detection; --force
     # only disables the unchanged-skip.
@@ -1065,12 +1089,13 @@ def sync(args: argparse.Namespace) -> None:
     print(f"  found {len(rels)} markdown files in scope")
 
     previous_source = cache.get(SOURCE_CACHE_KEY, {})
-    if (not args.force
-            and previous_source.get("fingerprint") == source_fingerprint
-            and source_outputs_complete(previous_source)):
+    if (
+        not args.force
+        and previous_source.get("fingerprint") == source_fingerprint
+        and source_outputs_complete(previous_source)
+    ):
         total_files = len(previous_source["outputs"])
-        print("  Source tree unchanged and all outputs present; "
-              "skipping content downloads and conversion")
+        print("  Source tree unchanged and all outputs present; skipping content downloads and conversion")
         print("\nSync complete:")
         print("  Added:       0")
         print("  Updated:     0")
@@ -1113,8 +1138,10 @@ def sync(args: argparse.Namespace) -> None:
         for rel in sorted(missing):
             print(f"    SKIP {rel}")
     if missing or missing_data:
-        print("ERROR: source tree entries could not be fetched; leaving the "
-              "existing mirror untouched", file=sys.stderr)
+        print(
+            "ERROR: source tree entries could not be fetched; leaving the existing mirror untouched",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     pages: list[dict] = []
@@ -1127,10 +1154,11 @@ def sync(args: argparse.Namespace) -> None:
         pages.append(page)
 
     leaves = [p for p in pages if not p["is_index"]]
-    indexes = {p["url"]: {"title": p["title"],
-                          "description": p["description"],
-                          "weight": p["weight"]}
-               for p in pages if p["is_index"]}
+    indexes = {
+        p["url"]: {"title": p["title"], "description": p["description"], "weight": p["weight"]}
+        for p in pages
+        if p["is_index"]
+    }
     pages_by_url = {p["url"]: p for p in leaves}
     aliases: dict[str, str] = {}
     for p in leaves:
@@ -1160,11 +1188,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             return
         is_new = cache_key not in cache or not os.path.exists(file_path)
-        write_file(file_path, content, dry_run=args.dry_run,
-                   verbose=args.verbose, label="ADD" if is_new else "UPDATE")
+        write_file(
+            file_path,
+            content,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -1172,8 +1205,11 @@ def sync(args: argparse.Namespace) -> None:
             updated += 1
 
     for page in leaves:
-        emit(page["url"], os.path.join(DOCS_DIR, *page["url"].split("/")) + ".md",
-             build_page_markdown(page, conv))
+        emit(
+            page["url"],
+            os.path.join(DOCS_DIR, *page["url"].split("/")) + ".md",
+            build_page_markdown(page, conv),
+        )
 
     by_section: dict[str, list[dict]] = {}
     for p in leaves:
@@ -1182,18 +1218,19 @@ def sync(args: argparse.Namespace) -> None:
     for section in SECTIONS:
         if section not in by_section:
             continue
-        emit(f"__readme__/{section}",
-             os.path.join(DOCS_DIR, section, "README.md"),
-             build_section_readme(section, by_section[section], indexes))
+        emit(
+            f"__readme__/{section}",
+            os.path.join(DOCS_DIR, section, "README.md"),
+            build_section_readme(section, by_section[section], indexes),
+        )
 
-    emit("__readme__/_top", os.path.join(DOCS_DIR, "README.md"),
-         build_top_readme(by_section, indexes))
+    emit("__readme__/_top", os.path.join(DOCS_DIR, "README.md"), build_top_readme(by_section, indexes))
 
     new_cache[SOURCE_CACHE_KEY] = {
         "fingerprint": source_fingerprint,
         "outputs": sorted(output_paths),
         "page_count": len(leaves),
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": datetime.now(UTC).isoformat(),
     }
 
     # Removals
@@ -1206,8 +1243,7 @@ def sync(args: argparse.Namespace) -> None:
         if old_key == "__readme__/_top":
             old_path = os.path.join(DOCS_DIR, "README.md")
         elif old_key.startswith("__readme__/"):
-            old_path = os.path.join(
-                DOCS_DIR, old_key[len("__readme__/"):], "README.md")
+            old_path = os.path.join(DOCS_DIR, old_key[len("__readme__/") :], "README.md")
         else:
             old_path = os.path.join(DOCS_DIR, *old_key.split("/")) + ".md"
         if not os.path.exists(old_path):
@@ -1250,12 +1286,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch Authelia docs from GitHub and mirror to local markdown"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

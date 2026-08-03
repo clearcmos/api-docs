@@ -17,7 +17,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -36,13 +37,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "ollama-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "ollama-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -58,8 +62,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -85,6 +89,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # Index parsing
 # ---------------------------------------------------------------------------
 
+
 def parse_llms_index(text: str) -> list[dict]:
     """Parse llms.txt into a list of {section, title, url, summary} entries.
 
@@ -93,9 +98,7 @@ def parse_llms_index(text: str) -> list[dict]:
     """
     section = ""
     entries: list[dict] = []
-    link_re = re.compile(
-        r"^- \[([^\]]+)\]\((https://docs\.ollama\.com/[^)]+)\)\s*(?::\s*(.*))?$"
-    )
+    link_re = re.compile(r"^- \[([^\]]+)\]\((https://docs\.ollama\.com/[^)]+)\)\s*(?::\s*(.*))?$")
     for line in text.splitlines():
         if line.startswith("## "):
             section = line[3:].strip()
@@ -105,12 +108,14 @@ def parse_llms_index(text: str) -> list[dict]:
             title = m.group(1).strip()
             url = m.group(2).strip()
             summary = (m.group(3) or "").strip()
-            entries.append({
-                "section": section,
-                "title": title,
-                "url": url,
-                "summary": summary,
-            })
+            entries.append(
+                {
+                    "section": section,
+                    "title": title,
+                    "url": url,
+                    "summary": summary,
+                }
+            )
     return entries
 
 
@@ -122,7 +127,7 @@ def path_for_md(url: str) -> tuple[str, str, str]:
     https://docs.ollama.com/index.md            -> ("", "index", docs/README.md)
     https://docs.ollama.com/api/introduction.md -> ("api", "introduction", docs/api/introduction.md)
     """
-    rel = url[len(f"{SITE}/"):]
+    rel = url[len(f"{SITE}/") :]
     if rel.endswith(".md"):
         rel = rel[:-3]
     parts = rel.split("/")
@@ -211,6 +216,7 @@ def build_top_readme(categories: dict[str, list[dict]], openapi_links: list[dict
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
 
@@ -221,8 +227,7 @@ def sync(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     entries = parse_llms_index(index_text)
-    doc_entries = [e for e in entries if e["section"].lower() != "openapi specs"
-                   and e["url"].endswith(".md")]
+    doc_entries = [e for e in entries if e["section"].lower() != "openapi specs" and e["url"].endswith(".md")]
     openapi_links = [e for e in entries if e["section"].lower() == "openapi specs"]
     print(f"  doc pages:    {len(doc_entries)}")
     print(f"  openapi refs: {len(openapi_links)}")
@@ -264,13 +269,15 @@ def sync(args: argparse.Namespace) -> None:
         url = entry["url"]
         raw = fetched.get(url)
         category, slug, file_path = path_for_md(url)
-        cache_key = url[len(SITE) + 1:]  # path within docs.ollama.com
+        cache_key = url[len(SITE) + 1 :]  # path within docs.ollama.com
 
-        categories.setdefault(category, []).append({
-            "slug": slug if not (category == "" and slug == "index") else "index",
-            "title": entry["title"],
-            "summary": entry["summary"],
-        })
+        categories.setdefault(category, []).append(
+            {
+                "slug": slug if not (category == "" and slug == "index") else "index",
+                "title": entry["title"],
+                "summary": entry["summary"],
+            }
+        )
 
         prev = cache.get(cache_key, {})
         if raw is None:
@@ -293,7 +300,7 @@ def sync(args: argparse.Namespace) -> None:
         write_file(file_path, content, dry_run=args.dry_run, verbose=args.verbose, label=label)
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -316,11 +323,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             continue
         is_new = cache_key not in cache or not os.path.exists(readme_path)
-        write_file(readme_path, readme_content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            readme_path,
+            readme_content,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -339,11 +351,16 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[top_key] = prev
     else:
         is_new = top_key not in cache or not os.path.exists(top_path)
-        write_file(top_path, top_readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            top_path,
+            top_readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[top_key] = {
             "sha256": top_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -356,7 +373,7 @@ def sync(args: argparse.Namespace) -> None:
         if old_key in new_cache:
             continue
         if old_key.startswith("__readme__/"):
-            name = old_key[len("__readme__/"):]
+            name = old_key[len("__readme__/") :]
             if name == "_top":
                 old_path = os.path.join(DOCS_DIR, "README.md")
             else:
@@ -406,15 +423,10 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Fetch Ollama documentation and mirror to local markdown"
-    )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser = argparse.ArgumentParser(description="Fetch Ollama documentation and mirror to local markdown")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

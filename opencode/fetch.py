@@ -32,7 +32,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -53,13 +54,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -75,8 +79,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -170,14 +174,10 @@ def parse_sitemap_english(xml_text: str) -> set[str]:
     for loc in locs:
         if not loc.startswith(SITE + "/docs"):
             continue
-        path = loc[len(SITE):]
-        rel = path[len("/docs/"):] if path.startswith("/docs/") else path[len("/docs"):]
+        path = loc[len(SITE) :]
+        rel = path[len("/docs/") :] if path.startswith("/docs/") else path[len("/docs") :]
         rels.append(rel)
-    locales = {
-        rel[:-1]
-        for rel in rels
-        if rel.endswith("/") and rel.count("/") == 1 and rel[:-1]
-    }
+    locales = {rel[:-1] for rel in rels if rel.endswith("/") and rel.count("/") == 1 and rel[:-1]}
     english: set[str] = set()
     for rel in rels:
         r = rel.rstrip("/")
@@ -229,6 +229,7 @@ def discover() -> list[dict]:
 # ---------------------------------------------------------------------------
 # URL / path helpers
 # ---------------------------------------------------------------------------
+
 
 def md_url(slug: str) -> str:
     return f"{SITE}/docs/index.md" if slug == "" else f"{SITE}/docs/{slug}.md"
@@ -409,6 +410,7 @@ def build_readme(entries: list[dict]) -> str:
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
 
@@ -464,11 +466,12 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[key] = prev
             continue
         is_new = key not in cache or not os.path.exists(path)
-        write_file(path, content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            path, content, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+        )
         new_cache[key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -486,11 +489,16 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[readme_key] = prev
     else:
         is_new = readme_key not in cache or not os.path.exists(readme_path)
-        write_file(readme_path, readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            readme_path,
+            readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[readme_key] = {
             "sha256": readme_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -502,8 +510,7 @@ def sync(args: argparse.Namespace) -> None:
     for old_key in sorted(cache):
         if old_key in new_cache:
             continue
-        old_path = (readme_path if old_key == "__readme__"
-                    else path_from_cache_key(old_key))
+        old_path = readme_path if old_key == "__readme__" else path_from_cache_key(old_key)
         if not os.path.exists(old_path):
             continue
         if args.dry_run:
@@ -544,15 +551,10 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Fetch OpenCode documentation and mirror to local markdown"
-    )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser = argparse.ArgumentParser(description="Fetch OpenCode documentation and mirror to local markdown")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

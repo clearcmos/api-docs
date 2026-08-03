@@ -25,7 +25,7 @@ import re
 import sys
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -41,21 +41,25 @@ CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 # Standard helpers
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, description: str = "", timeout: int = 30) -> str | None:
     """Fetch a URL with error handling."""
-    req = Request(url, headers={
-        "User-Agent": "rippling-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "rippling-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         if description:
             print(f"  Fetching: {description}")
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -72,8 +76,9 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -86,6 +91,7 @@ def save_cache(cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # OpenAPI helpers (for .api.mdx spec fragments)
 # ---------------------------------------------------------------------------
+
 
 def resolve_ref(ref: str, spec: dict) -> dict:
     """Resolve a $ref pointer like '#/components/schemas/Foo'."""
@@ -185,7 +191,7 @@ def schema_to_markdown(schema: dict, spec: dict, depth: int = 0, seen: set | Non
     if schema_type:
         fmt = schema.get("format", "")
         enum = schema.get("enum")
-        result = schema_type
+        result = str(schema_type)
         if fmt:
             result += f" ({fmt})"
         if enum:
@@ -291,6 +297,7 @@ def format_responses(responses: dict, spec: dict) -> str:
 # Webpack / Docusaurus bundle extraction
 # ---------------------------------------------------------------------------
 
+
 def extract_js_bundle_urls(html_content: str) -> tuple[str | None, str | None]:
     """Extract the main.js and runtime.js URLs from the HTML page."""
     main_match = re.search(r'src="(/assets/js/main\.[^"]+\.js)"', html_content)
@@ -328,37 +335,37 @@ def parse_webpack_loaders(main_js: str, content_hashes: dict[str, str]) -> dict[
     webpack_info = {}
     for route, ch in content_hashes.items():
         # Try quoted key first, then unquoted JS identifier
-        for search in [f'"{ch}":[', f'{ch}:[']:
+        for search in [f'"{ch}":[', f"{ch}:["]:
             idx = main_js.find(search)
             if idx >= 0:
-                if search == f'{ch}:[' and idx > 0 and main_js[idx - 1] not in ',{':
+                if search == f"{ch}:[" and idx > 0 and main_js[idx - 1] not in ",{":
                     continue
                 break
         else:
             continue
 
-        bracket_start = main_js.find('[', idx)
+        bracket_start = main_js.find("[", idx)
         bracket_count = 0
         end = bracket_start
         while end < len(main_js):
-            if main_js[end] == '[':
+            if main_js[end] == "[":
                 bracket_count += 1
-            elif main_js[end] == ']':
+            elif main_js[end] == "]":
                 bracket_count -= 1
                 if bracket_count == 0:
                     break
             end += 1
 
-        loader = main_js[idx:end + 1]
-        all_chunks = re.findall(r'n\.e\((\d+)\)', loader)
-        module_id = re.search(r'n\.bind\(n,(\d+)\)', loader)
+        loader = main_js[idx : end + 1]
+        all_chunks = re.findall(r"n\.e\((\d+)\)", loader)
+        module_id = re.search(r"n\.bind\(n,(\d+)\)", loader)
         source = re.search(r'"(@site/[^"]+)"', loader)
 
         webpack_info[route] = {
-            'content_hash': ch,
-            'all_chunks': all_chunks,
-            'module_id': module_id.group(1) if module_id else None,
-            'source': source.group(1) if source else None,
+            "content_hash": ch,
+            "all_chunks": all_chunks,
+            "module_id": module_id.group(1) if module_id else None,
+            "source": source.group(1) if source else None,
         }
     return webpack_info
 
@@ -370,11 +377,11 @@ def parse_chunk_filename_map(runtime_js: str) -> dict[str, str]:
         return {}
 
     # Find all mapping objects within the t.u function
-    end_candidates = [m.start() for m in re.finditer(r',t\.\w+=', runtime_js[idx + 10:])]
+    end_candidates = [m.start() for m in re.finditer(r",t\.\w+=", runtime_js[idx + 10 :])]
     func_end = idx + 10 + end_candidates[0] if end_candidates else len(runtime_js)
     func_body = runtime_js[idx:func_end]
 
-    maps = re.findall(r'\{([^}]+)\}\[e\]', func_body)
+    maps = re.findall(r"\{([^}]+)\}\[e\]", func_body)
     if len(maps) < 2:
         return {}
 
@@ -401,7 +408,7 @@ def determine_content_chunk(webpack_info_entry: dict, chunk_url_map: dict) -> st
     For pages with multiple chunks (Promise.all), the content is in the
     last unique chunk (others are shared component/framework chunks).
     """
-    all_chunks = webpack_info_entry.get('all_chunks', [])
+    all_chunks = webpack_info_entry.get("all_chunks", [])
     if not all_chunks:
         return None
 
@@ -414,6 +421,7 @@ def determine_content_chunk(webpack_info_entry: dict, chunk_url_map: dict) -> st
 # Content extraction from webpack chunks
 # ---------------------------------------------------------------------------
 
+
 def extract_api_spec_from_chunk(chunk_js: str) -> dict | None:
     """Extract the base64+zlib compressed OpenAPI operation from an API reference chunk."""
     api_match = re.search(r'api:"([^"]+)"', chunk_js)
@@ -423,7 +431,8 @@ def extract_api_spec_from_chunk(chunk_js: str) -> dict | None:
     try:
         decoded = base64.b64decode(api_match.group(1))
         decompressed = zlib.decompress(decoded)
-        return json.loads(decompressed)
+        spec = json.loads(decompressed)
+        return spec if isinstance(spec, dict) else None
     except Exception:
         return None
 
@@ -434,15 +443,15 @@ def extract_frontmatter(chunk_js: str) -> dict:
 
     title_match = re.search(r'title:"([^"]*)"', chunk_js)
     if title_match:
-        frontmatter['title'] = title_match.group(1)
+        frontmatter["title"] = title_match.group(1)
 
     desc_match = re.search(r'description:"([^"]*)"', chunk_js)
     if desc_match:
-        frontmatter['description'] = desc_match.group(1)
+        frontmatter["description"] = desc_match.group(1)
 
     label_match = re.search(r'sidebar_label:"([^"]*)"', chunk_js)
     if label_match:
-        frontmatter['sidebar_label'] = label_match.group(1)
+        frontmatter["sidebar_label"] = label_match.group(1)
 
     return frontmatter
 
@@ -453,14 +462,14 @@ def jsx_to_markdown(chunk_js: str) -> str | None:
     Parses the compiled React JSX tree structure to extract text content
     and convert it back to markdown format.
     """
-    func_match = re.search(r'function c\(e\)\{', chunk_js)
+    func_match = re.search(r"function c\(e\)\{", chunk_js)
     if not func_match:
         return None
 
     func_start = func_match.start()
-    func_end_match = re.search(r'function [a-z]\(', chunk_js[func_start + 20:])
+    func_end_match = re.search(r"function [a-z]\(", chunk_js[func_start + 20 :])
     if func_end_match:
-        func_body = chunk_js[func_start:func_start + 20 + func_end_match.start()]
+        func_body = chunk_js[func_start : func_start + 20 + func_end_match.start()]
     else:
         func_body = chunk_js[func_start:]
 
@@ -470,132 +479,133 @@ def jsx_to_markdown(chunk_js: str) -> str | None:
     for m in re.finditer(r'children:"((?:[^"\\]|\\.)*)"', func_body):
         text = m.group(1)
         # Unescape
-        text = text.replace('\\n', '\n').replace('\\t', '\t')
+        text = text.replace("\\n", "\n").replace("\\t", "\t")
         text = text.replace("\\'", "'").replace('\\"', '"')
-        text = text.encode().decode('unicode_escape', errors='replace')
+        text = text.encode().decode("unicode_escape", errors="replace")
 
         # Find the tag by looking backwards for s.TAG
-        preceding = func_body[max(0, m.start() - 150):m.start()]
+        preceding = func_body[max(0, m.start() - 150) : m.start()]
 
-        tag_match = re.search(r's\.(h[1-6]|p|li|td|th|code|strong|em|pre|a),\{', preceding)
-        container_match = re.search(r's\.(table|thead|tbody|tr|ul|ol),', preceding)
+        tag_match = re.search(r"s\.(h[1-6]|p|li|td|th|code|strong|em|pre|a),\{", preceding)
+        container_match = re.search(r"s\.(table|thead|tbody|tr|ul|ol),", preceding)
 
         if tag_match:
             tag = tag_match.group(1)
         elif container_match:
             tag = container_match.group(1)
         else:
-            tag = 'text'
+            tag = "text"
 
         segments.append((tag, text))
 
     # Convert segments to markdown
     md_lines = []
-    table_data = {'headers': [], 'rows': [], 'current_row': []}
+    table_data: dict[str, list] = {"headers": [], "rows": [], "current_row": []}
     i = 0
 
     while i < len(segments):
         tag, text = segments[i]
 
-        if tag.startswith('h') and len(tag) == 2:
+        if tag.startswith("h") and len(tag) == 2:
             level = int(tag[1])
             md_lines.append(f"\n{'#' * level} {text}\n")
-        elif tag == 'p':
+        elif tag == "p":
             md_lines.append(f"\n{text}\n")
-        elif tag == 'li':
+        elif tag == "li":
             md_lines.append(f"- {text}")
-        elif tag == 'th':
-            table_data['headers'].append(text)
-        elif tag == 'td':
-            table_data['current_row'].append(text)
-            if table_data['headers'] and len(table_data['current_row']) >= len(table_data['headers']):
-                table_data['rows'].append(table_data['current_row'])
-                table_data['current_row'] = []
-        elif tag == 'code':
+        elif tag == "th":
+            table_data["headers"].append(text)
+        elif tag == "td":
+            table_data["current_row"].append(text)
+            if table_data["headers"] and len(table_data["current_row"]) >= len(table_data["headers"]):
+                table_data["rows"].append(table_data["current_row"])
+                table_data["current_row"] = []
+        elif tag == "code":
             md_lines.append(f"`{text}`")
-        elif tag == 'strong':
+        elif tag == "strong":
             md_lines.append(f"**{text}**")
-        elif tag == 'em':
+        elif tag == "em":
             md_lines.append(f"*{text}*")
-        elif tag == 'pre':
+        elif tag == "pre":
             md_lines.append(f"\n```\n{text}\n```\n")
-        elif tag == 'text':
+        elif tag == "text":
             if text.strip():
                 md_lines.append(text)
 
         # Flush table when we hit a non-table tag after collecting table data
-        if tag not in ('th', 'td', 'tr', 'thead', 'tbody', 'table') and table_data['headers']:
+        if tag not in ("th", "td", "tr", "thead", "tbody", "table") and table_data["headers"]:
             md_lines.append("")
-            md_lines.append("| " + " | ".join(table_data['headers']) + " |")
-            md_lines.append("| " + " | ".join(["---"] * len(table_data['headers'])) + " |")
-            for row in table_data['rows']:
+            md_lines.append("| " + " | ".join(table_data["headers"]) + " |")
+            md_lines.append("| " + " | ".join(["---"] * len(table_data["headers"])) + " |")
+            for row in table_data["rows"]:
                 md_lines.append("| " + " | ".join(row) + " |")
             md_lines.append("")
-            table_data = {'headers': [], 'rows': [], 'current_row': []}
+            table_data = {"headers": [], "rows": [], "current_row": []}
 
         i += 1
 
     # Flush any remaining table
-    if table_data['headers']:
+    if table_data["headers"]:
         md_lines.append("")
-        md_lines.append("| " + " | ".join(table_data['headers']) + " |")
-        md_lines.append("| " + " | ".join(["---"] * len(table_data['headers'])) + " |")
-        for row in table_data['rows']:
+        md_lines.append("| " + " | ".join(table_data["headers"]) + " |")
+        md_lines.append("| " + " | ".join(["---"] * len(table_data["headers"])) + " |")
+        for row in table_data["rows"]:
             md_lines.append("| " + " | ".join(row) + " |")
         md_lines.append("")
 
-    return '\n'.join(md_lines)
+    return "\n".join(md_lines)
 
 
 # ---------------------------------------------------------------------------
 # Markdown builders
 # ---------------------------------------------------------------------------
 
+
 def build_endpoint_markdown(api_spec: dict, frontmatter: dict) -> str:
     """Convert an OpenAPI operation spec fragment to markdown."""
     lines = []
 
-    title = frontmatter.get('title', api_spec.get('summary', api_spec.get('operationId', 'API Endpoint')))
+    title = frontmatter.get("title", api_spec.get("summary", api_spec.get("operationId", "API Endpoint")))
     lines.append(f"# {title}\n")
 
-    description = api_spec.get('description', frontmatter.get('description', ''))
+    description = api_spec.get("description", frontmatter.get("description", ""))
     if description:
         lines.append(f"{description}\n")
 
-    tags = api_spec.get('tags', [])
+    tags = api_spec.get("tags", [])
     if tags:
         lines.append(f"**Tags:** {', '.join(f'`{t}`' for t in tags)}\n")
 
-    op_id = api_spec.get('operationId', '')
+    op_id = api_spec.get("operationId", "")
     if op_id:
         lines.append(f"**Operation ID:** `{op_id}`\n")
 
-    method = api_spec.get('method', '').upper()
-    path = api_spec.get('path', '')
+    method = api_spec.get("method", "").upper()
+    path = api_spec.get("path", "")
     if method and path:
         lines.append("## Request\n")
         lines.append(f"**Method:** `{method}`\n")
         lines.append(f"**Endpoint:** `{path}`\n")
 
-    servers = api_spec.get('servers', [])
+    servers = api_spec.get("servers", [])
     if servers:
         lines.append(f"**Base URL:** `{servers[0].get('url', '')}`\n")
 
     # The spec fragments are self-contained -- use the spec itself as the
     # root for $ref resolution (they typically don't have external refs).
-    parameters = api_spec.get('parameters', [])
+    parameters = api_spec.get("parameters", [])
     if parameters:
         lines.append(format_parameters(parameters, api_spec))
 
-    request_body = api_spec.get('requestBody')
+    request_body = api_spec.get("requestBody")
     if request_body:
         lines.append(format_request_body(request_body, api_spec))
 
-    responses = api_spec.get('responses', {})
+    responses = api_spec.get("responses", {})
     if responses:
         lines.append(format_responses(responses, api_spec))
 
-    security = api_spec.get('security', [])
+    security = api_spec.get("security", [])
     if security:
         lines.append("### Security\n")
         for sec in security:
@@ -612,15 +622,15 @@ def build_endpoint_markdown(api_spec: dict, frontmatter: dict) -> str:
 def build_guide_markdown(chunk_js: str, frontmatter: dict) -> str:
     """Build markdown for a guide/essential page from compiled JSX."""
     markdown = jsx_to_markdown(chunk_js)
-    slug = frontmatter.get('title', '')
+    frontmatter.get("title", "")
 
     if not markdown or len(markdown.strip()) < 50:
-        title = frontmatter.get('title', 'Untitled')
-        desc = frontmatter.get('description', '')
+        title = frontmatter.get("title", "Untitled")
+        desc = frontmatter.get("description", "")
         markdown = f"# {title}\n\n{desc}\n"
 
     # Prepend title if not already in content
-    title = frontmatter.get('title', '')
+    title = frontmatter.get("title", "")
     if title and not markdown.strip().startswith(f"# {title}"):
         markdown = f"# {title}\n{markdown}"
 
@@ -629,11 +639,11 @@ def build_guide_markdown(chunk_js: str, frontmatter: dict) -> str:
 
 def categorize_route(route: str) -> str:
     """Categorize a route into a directory based on the first path segment after rest-api/."""
-    path = route.replace('/documentation/rest-api/', '')
-    parts = path.split('/')
+    path = route.replace("/documentation/rest-api/", "")
+    parts = path.split("/")
     if len(parts) >= 2:
         return parts[0]
-    return 'overview'
+    return "overview"
 
 
 def build_category_readme(category: str, entries: list[tuple[str, str, str]]) -> str:
@@ -657,7 +667,7 @@ def build_top_readme(categories: dict[str, list]) -> str:
     ]
     for cat in sorted(categories.keys()):
         count = len(categories[cat])
-        display = cat.replace('-', ' ').title()
+        display = cat.replace("-", " ").title()
         lines.append(f"- [{display}](./{cat}/) ({count} pages)")
     lines.append("")
     return "\n".join(lines)
@@ -667,14 +677,22 @@ def build_top_readme(categories: dict[str, list]) -> str:
 # Sync
 # ---------------------------------------------------------------------------
 
-def write_file(path: str, content: str, cache_key: str, cache: dict,
-               new_cache: dict, counters: dict, args: argparse.Namespace,
-               display_path: str) -> None:
+
+def write_file(
+    path: str,
+    content: str,
+    cache_key: str,
+    cache: dict,
+    new_cache: dict,
+    counters: dict,
+    args: argparse.Namespace,
+    display_path: str,
+) -> None:
     """Write a file with cache checking. Mutates new_cache and counters."""
     content_hash = sha256(content)
 
     if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(path):
-        counters['unchanged'] += 1
+        counters["unchanged"] += 1
         new_cache[cache_key] = cache[cache_key]
         return
 
@@ -692,18 +710,18 @@ def write_file(path: str, content: str, cache_key: str, cache: dict,
 
     new_cache[cache_key] = {
         "sha256": content_hash,
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": datetime.now(UTC).isoformat(),
     }
     if is_new:
-        counters['added'] += 1
+        counters["added"] += 1
     else:
-        counters['updated'] += 1
+        counters["updated"] += 1
 
 
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
     new_cache = {}
-    counters = {'added': 0, 'updated': 0, 'unchanged': 0, 'removed': 0}
+    counters = {"added": 0, "updated": 0, "unchanged": 0, "removed": 0}
 
     # ------------------------------------------------------------------
     # Step 1: Fetch the landing page to get JS bundle URLs
@@ -773,7 +791,10 @@ def sync(args: argparse.Namespace) -> None:
     route_chunk_urls: dict[str, str] = {}
 
     def preserve_cached_route(
-        category: str, filename: str, slug: str, cache_key: str,
+        category: str,
+        filename: str,
+        slug: str,
+        cache_key: str,
         entries: list[tuple[str, str, str]],
     ) -> None:
         """Keep a failed route and its catalogue entry when a local copy exists."""
@@ -784,7 +805,7 @@ def sync(args: argparse.Namespace) -> None:
         title = entry.get("title", "")
         if not title:
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
+                with open(filepath, encoding="utf-8") as f:
                     title = f.readline().strip().removeprefix("# ").strip()
             except OSError:
                 title = ""
@@ -801,8 +822,7 @@ def sync(args: argparse.Namespace) -> None:
             route_chunk_urls[route] = f"{BASE_URL}/{chunk_path}"
 
     unique_chunk_urls = sorted(set(route_chunk_urls.values()))
-    print(f"\nFetching {len(unique_chunk_urls)} content chunks "
-          f"(concurrency={MAX_WORKERS})...")
+    print(f"\nFetching {len(unique_chunk_urls)} content chunks (concurrency={MAX_WORKERS})...")
 
     chunk_contents: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -825,8 +845,8 @@ def sync(args: argparse.Namespace) -> None:
 
         for route in cat_routes:
             info = webpack_info[route]
-            slug = route.split('/')[-1]
-            filename = sanitize_filename(slug) + '.md'
+            slug = route.split("/")[-1]
+            filename = sanitize_filename(slug) + ".md"
             cache_key = f"cat:{category}:{filename}"
 
             # Get the content chunk URL
@@ -834,30 +854,27 @@ def sync(args: argparse.Namespace) -> None:
             if not chunk_url:
                 print(f"  SKIP (no chunk): {slug}")
                 fail_count += 1
-                preserve_cached_route(
-                    category, filename, slug, cache_key, cat_readme_entries)
+                preserve_cached_route(category, filename, slug, cache_key, cat_readme_entries)
                 continue
 
             chunk_js = chunk_contents.get(chunk_url)
             if not chunk_js:
                 print(f"  FAIL: {slug}")
                 fail_count += 1
-                preserve_cached_route(
-                    category, filename, slug, cache_key, cat_readme_entries)
+                preserve_cached_route(category, filename, slug, cache_key, cat_readme_entries)
                 continue
 
             # Check if this is a JS chunk or an HTML fallback (404-like)
-            if chunk_js.startswith('<!doctype') or chunk_js.startswith('<html'):
+            if chunk_js.startswith("<!doctype") or chunk_js.startswith("<html"):
                 print(f"  SKIP (HTML response): {slug}")
                 fail_count += 1
-                preserve_cached_route(
-                    category, filename, slug, cache_key, cat_readme_entries)
+                preserve_cached_route(category, filename, slug, cache_key, cat_readme_entries)
                 continue
 
             # Extract frontmatter
             frontmatter = extract_frontmatter(chunk_js)
-            source = info.get('source', '')
-            is_api_page = source.endswith('.api.mdx')
+            source = info.get("source", "")
+            is_api_page = source.endswith(".api.mdx")
 
             if is_api_page:
                 api_spec = extract_api_spec_from_chunk(chunk_js)
@@ -866,31 +883,32 @@ def sync(args: argparse.Namespace) -> None:
                 else:
                     print(f"  FAIL (no API spec): {slug}")
                     fail_count += 1
-                    preserve_cached_route(
-                        category, filename, slug, cache_key, cat_readme_entries)
+                    preserve_cached_route(category, filename, slug, cache_key, cat_readme_entries)
                     continue
             else:
                 markdown = build_guide_markdown(chunk_js, frontmatter)
 
             filepath = os.path.join(cat_dir, filename)
-            display_title = frontmatter.get('title', slug)
-            cat_readme_entries.append((display_title, filename, frontmatter.get('description', '')))
+            display_title = frontmatter.get("title", slug)
+            cat_readme_entries.append((display_title, filename, frontmatter.get("description", "")))
 
-            write_file(filepath, markdown, cache_key, cache, new_cache,
-                       counters, args, f"{category}/{filename}")
+            write_file(
+                filepath, markdown, cache_key, cache, new_cache, counters, args, f"{category}/{filename}"
+            )
             if cache_key in new_cache:
                 new_cache[cache_key] = {
                     **new_cache[cache_key],
                     "title": display_title,
-                    "description": frontmatter.get('description', ''),
+                    "description": frontmatter.get("description", ""),
                 }
 
         # Write category README
         readme_content = build_category_readme(category, cat_readme_entries)
         readme_path = os.path.join(cat_dir, "README.md")
         readme_key = f"cat:{category}:README"
-        write_file(readme_path, readme_content, readme_key, cache, new_cache,
-                   counters, args, f"{category}/README.md")
+        write_file(
+            readme_path, readme_content, readme_key, cache, new_cache, counters, args, f"{category}/README.md"
+        )
 
     # ------------------------------------------------------------------
     # Step 6: Top-level README
@@ -916,7 +934,7 @@ def sync(args: argparse.Namespace) -> None:
                         os.remove(old_path)
                         if args.verbose:
                             print(f"  REMOVE {parts[1]}/{parts[2]}")
-                    counters['removed'] += 1
+                    counters["removed"] += 1
 
     # Clean up empty category directories
     if not args.dry_run and os.path.exists(DOCS_DIR):
@@ -935,7 +953,7 @@ def sync(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {counters['added']}")
     print(f"  Updated:    {counters['updated']}")
     print(f"  Unchanged:  {counters['unchanged']}")

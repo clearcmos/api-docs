@@ -25,7 +25,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -44,13 +45,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "notion-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "notion-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -61,8 +65,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -99,11 +103,13 @@ def parse_index(index_text: str) -> list[dict]:
     for line in index_text.split("\n"):
         m = ENTRY_RE.match(line.strip())
         if m:
-            entries.append({
-                "title": m.group("title").strip(),
-                "url": m.group("url").strip(),
-                "description": (m.group("desc") or "").strip(),
-            })
+            entries.append(
+                {
+                    "title": m.group("title").strip(),
+                    "url": m.group("url").strip(),
+                    "description": (m.group("desc") or "").strip(),
+                }
+            )
     return entries
 
 
@@ -116,7 +122,7 @@ def classify(url: str) -> tuple[str, str, str]:
       guides/mcp/overview.md       -> ("guides", "mcp", "overview")
       page/changelog.md            -> ("page", "", "changelog")
     """
-    path = url[len(BASE_URL):].removesuffix(".md")
+    path = url[len(BASE_URL) :].removesuffix(".md")
     parts = path.split("/")
     if len(parts) == 2:
         return parts[0], "", parts[1]
@@ -129,6 +135,7 @@ def classify(url: str) -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 # Page formatting
 # ---------------------------------------------------------------------------
+
 
 def build_page_markdown(raw: str, entry: dict) -> str:
     """Prepend a small frontmatter header to the raw markdown alternate."""
@@ -158,6 +165,7 @@ def build_page_markdown(raw: str, entry: dict) -> str:
 # ---------------------------------------------------------------------------
 # README builders
 # ---------------------------------------------------------------------------
+
 
 def humanize(name: str) -> str:
     return name.replace("-", " ").replace("_", " ").title()
@@ -202,6 +210,7 @@ def build_top_readme(group_counts: dict[str, int]) -> str:
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
+
 
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
@@ -274,11 +283,16 @@ def sync(args: argparse.Namespace) -> None:
             continue
 
         is_new = cache_key not in cache or not os.path.exists(file_path)
-        write_file(file_path, content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            file_path,
+            content,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -305,11 +319,16 @@ def sync(args: argparse.Namespace) -> None:
                 new_cache[cache_key] = cache[cache_key]
             else:
                 is_new = cache_key not in cache or not os.path.exists(path)
-                write_file(path, readme, dry_run=args.dry_run, verbose=args.verbose,
-                           label="ADD" if is_new else "UPDATE")
+                write_file(
+                    path,
+                    readme,
+                    dry_run=args.dry_run,
+                    verbose=args.verbose,
+                    label="ADD" if is_new else "UPDATE",
+                )
                 new_cache[cache_key] = {
                     "sha256": h,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -329,11 +348,12 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = cache[cache_key]
         else:
             is_new = cache_key not in cache or not os.path.exists(path)
-            write_file(path, readme, dry_run=args.dry_run, verbose=args.verbose,
-                       label="ADD" if is_new else "UPDATE")
+            write_file(
+                path, readme, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+            )
             new_cache[cache_key] = {
                 "sha256": h,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -351,11 +371,16 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[cache_key] = cache[cache_key]
     else:
         is_new = cache_key not in cache or not os.path.exists(top_path)
-        write_file(top_path, top_readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            top_path,
+            top_readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": h,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -394,7 +419,7 @@ def sync(args: argparse.Namespace) -> None:
 
     # Clean up empty dirs
     if not args.dry_run and os.path.isdir(DOCS_DIR):
-        for root, dirs, files in os.walk(DOCS_DIR, topdown=False):
+        for root, _dirs, _files in os.walk(DOCS_DIR, topdown=False):
             if root == DOCS_DIR:
                 continue
             if not os.listdir(root):
@@ -406,7 +431,7 @@ def sync(args: argparse.Namespace) -> None:
         save_cache(new_cache)
 
     total = added + updated + unchanged
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:       {added}")
     print(f"  Updated:     {updated}")
     print(f"  Unchanged:   {unchanged}")
@@ -418,15 +443,10 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Fetch Notion API docs and convert to local markdown"
-    )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser = argparse.ArgumentParser(description="Fetch Notion API docs and convert to local markdown")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

@@ -21,7 +21,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -56,7 +57,7 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -72,8 +73,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -99,6 +100,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # Discovery
 # ---------------------------------------------------------------------------
 
+
 def discover_paths() -> tuple[list[str], str]:
     """Return source paths and a hash of their Git blobs."""
     print("Fetching repository tree...")
@@ -108,8 +110,7 @@ def discover_paths() -> tuple[list[str], str]:
         sys.exit(1)
     data = json.loads(body)
     if data.get("truncated"):
-        print("WARNING: tree response truncated; some files may be missing",
-              file=sys.stderr)
+        print("WARNING: tree response truncated; some files may be missing", file=sys.stderr)
     blobs = [
         (t["path"], t.get("sha", ""))
         for t in data.get("tree", [])
@@ -119,17 +120,21 @@ def discover_paths() -> tuple[list[str], str]:
     ]
     with open(__file__, "rb") as f:
         fetcher_hash = hashlib.sha256(f.read()).hexdigest()
-    fingerprint = sha256(json.dumps({
-        "blobs": sorted(blobs),
-        "fetcher": fetcher_hash,
-    }, separators=(",", ":")))
+    fingerprint = sha256(
+        json.dumps(
+            {
+                "blobs": sorted(blobs),
+                "fetcher": fetcher_hash,
+            },
+            separators=(",", ":"),
+        )
+    )
     return sorted(path for path, _ in blobs), fingerprint
 
 
 def source_outputs_complete(source: dict) -> bool:
     outputs = source.get("outputs", [])
-    return bool(outputs) and all(
-        os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
+    return bool(outputs) and all(os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
 
 
 def site_url_for(rel_path: str) -> str:
@@ -137,7 +142,7 @@ def site_url_for(rel_path: str) -> str:
     base = rel_path[:-4] if rel_path.endswith(".mdx") else rel_path[:-3]
     # Nextra renders an `index` file as the directory itself.
     if base.endswith("/index"):
-        base = base[:-len("/index")]
+        base = base[: -len("/index")]
     elif base == "index":
         return SITE_BASE + "/"
     return f"{SITE_BASE}/{base}/"
@@ -181,7 +186,7 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
             continue
         key, _, value = line.partition(":")
         meta[key.strip()] = value.strip().strip('"').strip("'")
-    return meta, text[m.end():]
+    return meta, text[m.end() :]
 
 
 def title_from(meta: dict[str, str], body: str, fallback: str) -> str:
@@ -217,6 +222,7 @@ def build_page_markdown(raw: str, source_url: str, repo_url: str) -> tuple[str, 
 # ---------------------------------------------------------------------------
 # Index generation
 # ---------------------------------------------------------------------------
+
 
 def build_top_readme(pages: list[dict]) -> str:
     by_section: dict[str, list[dict]] = {}
@@ -256,7 +262,7 @@ def build_section_readme(section: str, pages: list[dict]) -> str:
     direct: list[dict] = []
     by_subdir: dict[str, list[dict]] = {}
     for p in pages:
-        link_in_section = p["link"][len(section) + 1:]  # strip "section/"
+        link_in_section = p["link"][len(section) + 1 :]  # strip "section/"
         parts = link_in_section.split("/")
         if len(parts) == 1:
             direct.append(p)
@@ -265,7 +271,7 @@ def build_section_readme(section: str, pages: list[dict]) -> str:
 
     if direct:
         for p in sorted(direct, key=lambda x: x["link"]):
-            name = p["link"][len(section) + 1:]
+            name = p["link"][len(section) + 1 :]
             lines.append(f"- [{p['title']}](./{name})")
         lines.append("")
     for sub in sorted(by_subdir):
@@ -273,7 +279,7 @@ def build_section_readme(section: str, pages: list[dict]) -> str:
         lines.append(f"### {sub_display}")
         lines.append("")
         for p in sorted(by_subdir[sub], key=lambda x: x["link"]):
-            rel_after_section = p["link"][len(section) + 1:]
+            rel_after_section = p["link"][len(section) + 1 :]
             lines.append(f"- [{p['title']}](./{rel_after_section})")
         lines.append("")
     return "\n".join(lines)
@@ -283,6 +289,7 @@ def build_section_readme(section: str, pages: list[dict]) -> str:
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
 
@@ -290,12 +297,13 @@ def sync(args: argparse.Namespace) -> None:
     print(f"  found {len(repo_paths)} en/ markdown files")
 
     previous_source = cache.get(SOURCE_CACHE_KEY, {})
-    if (not args.force
-            and previous_source.get("fingerprint") == source_fingerprint
-            and source_outputs_complete(previous_source)):
+    if (
+        not args.force
+        and previous_source.get("fingerprint") == source_fingerprint
+        and source_outputs_complete(previous_source)
+    ):
         total_files = len(previous_source["outputs"])
-        print("  Source tree unchanged and all outputs present; "
-              "skipping content downloads and conversion")
+        print("  Source tree unchanged and all outputs present; skipping content downloads and conversion")
         print("\nSync complete:")
         print("  Added:       0")
         print("  Updated:     0")
@@ -327,8 +335,10 @@ def sync(args: argparse.Namespace) -> None:
         if args.verbose:
             for rp in sorted(missing):
                 print(f"    SKIP {rp}")
-        print("ERROR: source tree entries could not be fetched; leaving the "
-              "existing mirror untouched", file=sys.stderr)
+        print(
+            "ERROR: source tree entries could not be fetched; leaving the existing mirror untouched",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if not args.dry_run:
@@ -345,9 +355,8 @@ def sync(args: argparse.Namespace) -> None:
         raw = fetched.get(rp)
         if raw is None:
             continue
-        content_rel = rp[len(CONTENT_PREFIX):]            # e.g. users/quickstart.md
-        rel_no_ext = (content_rel[:-4] if content_rel.endswith(".mdx")
-                      else content_rel[:-3])
+        content_rel = rp[len(CONTENT_PREFIX) :]  # e.g. users/quickstart.md
+        rel_no_ext = content_rel[:-4] if content_rel.endswith(".mdx") else content_rel[:-3]
         source_url = site_url_for(content_rel)
         repo_url = f"https://github.com/{REPO}/blob/{BRANCH}/{rp}"
         page, title = build_page_markdown(raw, source_url, repo_url)
@@ -368,12 +377,14 @@ def sync(args: argparse.Namespace) -> None:
             section = parts[0] if len(parts) > 1 else ""
             link = rel_no_ext + ".md"
 
-        pages.append({
-            "section": section,
-            "link": link,
-            "title": title or content_rel,
-            "source_url": source_url,
-        })
+        pages.append(
+            {
+                "section": section,
+                "link": link,
+                "title": title or content_rel,
+                "source_url": source_url,
+            }
+        )
 
         content_hash = sha256(page)
         prev = cache.get(cache_key, {})
@@ -387,7 +398,7 @@ def sync(args: argparse.Namespace) -> None:
         write_file(file_path, page, dry_run=args.dry_run, verbose=args.verbose, label=label)
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -413,11 +424,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             continue
         is_new = cache_key not in cache or not os.path.exists(readme_path)
-        write_file(readme_path, readme_content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            readme_path,
+            readme_content,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -436,11 +452,16 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[top_key] = prev
     else:
         is_new = top_key not in cache or not os.path.exists(top_path)
-        write_file(top_path, top_readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            top_path,
+            top_readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[top_key] = {
             "sha256": top_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -451,7 +472,7 @@ def sync(args: argparse.Namespace) -> None:
         "fingerprint": source_fingerprint,
         "outputs": sorted(output_paths),
         "page_count": len(pages),
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": datetime.now(UTC).isoformat(),
     }
 
     # Removals
@@ -462,7 +483,7 @@ def sync(args: argparse.Namespace) -> None:
         if old_key == SOURCE_CACHE_KEY:
             continue
         if old_key.startswith("__readme__/"):
-            name = old_key[len("__readme__/"):]
+            name = old_key[len("__readme__/") :]
             if name == "_top":
                 old_path = os.path.join(DOCS_DIR, "README.md")
             else:
@@ -511,12 +532,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch Qwen Code English docs from GitHub and mirror to local markdown"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

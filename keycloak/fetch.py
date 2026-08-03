@@ -33,8 +33,9 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -82,18 +83,22 @@ MANUALS = (
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, timeout: int = 120) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "keycloak-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "keycloak-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8", errors="replace")
@@ -109,8 +114,8 @@ def fetch_url(url: str, timeout: int = 120) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -135,6 +140,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # ---------------------------------------------------------------------------
 # HTML to Markdown converter
 # ---------------------------------------------------------------------------
+
 
 class KeycloakHTMLExtractor(html.parser.HTMLParser):
     """Converts Keycloak AsciiDoc-rendered HTML pages to markdown.
@@ -169,12 +175,12 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
         self._tag_stack: list[dict] = []
 
         # Code-block state.
-        self._code_depth = 0           # nesting depth inside <pre>
+        self._code_depth = 0  # nesting depth inside <pre>
         self._code_content = ""
         self._code_lang = ""
 
         # List state.
-        self._list_types: list[str] = []    # "ul" / "ol"
+        self._list_types: list[str] = []  # "ul" / "ol"
         self._list_counters: list[int] = []
 
         # Table state.
@@ -186,8 +192,8 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
         self._cell_is_header = False
 
         # Admonition state (stack of type names).
-        self._admonitions: list[str] = []
-        self._admonition_skip_icon = 0   # skip depth inside <td class="icon">
+        self._admonitions: list[tuple[str, int]] = []
+        self._admonition_skip_icon = 0  # skip depth inside <td class="icon">
 
         # Page title.
         self._title = ""
@@ -229,9 +235,9 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
 
         # Skip sidebars, page-link boxes, ToC blocks, figure captions' images.
         skip_classes = (
-            "sidebarblock",          # <div class="sidebarblock page-links">
-            "top-menu-guides",       # top-of-manual menu
-            "top-menu-version",      # version picker
+            "sidebarblock",  # <div class="sidebarblock page-links">
+            "top-menu-guides",  # top-of-manual menu
+            "top-menu-version",  # version picker
         )
         if tag == "div" and any(sc in cls for sc in skip_classes):
             self._skip_depth = 1
@@ -241,7 +247,8 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
             return
 
         # Handle AsciiDoc admonition blocks: <div class="admonitionblock note">.
-        # Structure is <div class="admonitionblock TYPE"><table>...<td class="content">BODY</td></table></div>.
+        # Structure is an admonition div containing a table whose content cell
+        # holds the body.
         # We render as a blockquote prefixed with the admonition label, and
         # skip the icon cell entirely. We record the content_depth at which
         # the admonition opened so we can pop it when the matching </div> closes.
@@ -256,10 +263,9 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
                     return
 
         # Inside an admonition, skip the icon cell but keep the content cell.
-        if self._admonitions and tag == "td":
-            if "icon" in cls:
-                self._admonition_skip_icon = 1
-                return
+        if self._admonitions and tag == "td" and "icon" in cls:
+            self._admonition_skip_icon = 1
+            return
 
         if self._admonition_skip_icon > 0:
             if tag == "td":
@@ -368,10 +374,7 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
                 self._list_counters.append(0)
             self._list_counters[-1] += 1
             indent = "  " * (len(self._list_types) - 1)
-            if self._list_types[-1] == "ol":
-                marker = f"{self._list_counters[-1]}. "
-            else:
-                marker = "- "
+            marker = f"{self._list_counters[-1]}. " if self._list_types[-1] == "ol" else "- "
             self._current_line = indent + marker
             return
 
@@ -405,7 +408,7 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
         if tag in ("td", "th"):
             if self._in_table:
                 self._current_cell = ""
-                self._cell_is_header = (tag == "th" or self._in_thead)
+                self._cell_is_header = tag == "th" or self._in_thead
             return
 
         # Unknown/structural tags are a no-op: their text content still flows
@@ -489,9 +492,8 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
             if self._list_counters:
                 self._list_counters.pop()
             self._flush_line()
-            if not self._list_types:
-                if self._output and self._output[-1].strip():
-                    self._output.append("")
+            if not self._list_types and self._output and self._output[-1].strip():
+                self._output.append("")
         elif tag == "li":
             self._flush_line()
         elif tag == "blockquote":
@@ -593,19 +595,13 @@ class KeycloakHTMLExtractor(html.parser.HTMLParser):
 
     def _is_suppressed(self) -> bool:
         """True when we're inside a suppressed (anchor-only) <a>."""
-        for frame in reversed(self._tag_stack):
-            if frame.get("tag") == "a" and frame.get("suppress"):
-                return True
-        return False
+        return any(frame.get("tag") == "a" and frame.get("suppress") for frame in reversed(self._tag_stack))
 
     def _flush_line(self):
         line = self._current_line.rstrip()
         if line:
             # If we're inside a blockquote, prefix with "> ".
-            if any(t.get("tag") == "blockquote" for t in self._tag_stack):
-                line = "> " + line
-            # If we're inside an admonition, prefix subsequent lines with "> ".
-            elif self._admonitions:
+            if any(t.get("tag") == "blockquote" for t in self._tag_stack) or self._admonitions:
                 line = "> " + line
             self._output.append(line)
         elif self._admonitions and self._output and self._output[-1].startswith("> "):
@@ -668,6 +664,7 @@ def html_to_markdown(html_content: str) -> tuple[str, str]:
 # URL discovery
 # ---------------------------------------------------------------------------
 
+
 def parse_sitemap(xml_content: str) -> list[str]:
     root = ET.fromstring(xml_content)
     ns = ""
@@ -688,10 +685,7 @@ def is_guide_url(url: str) -> bool:
     path = p.path
     if path in GUIDE_EXACT:
         return True
-    for prefix in GUIDE_PREFIXES:
-        if path.startswith(prefix):
-            return True
-    return False
+    return any(path.startswith(prefix) for prefix in GUIDE_PREFIXES)
 
 
 def discover_urls() -> list[str]:
@@ -712,6 +706,7 @@ def discover_urls() -> list[str]:
 # Path mapping
 # ---------------------------------------------------------------------------
 
+
 def guide_path(url: str) -> str:
     """Map a keycloak.org guide URL to a local markdown file path."""
     p = urlparse(url)
@@ -730,6 +725,7 @@ def manual_path(slug: str) -> str:
 # Markdown assembly
 # ---------------------------------------------------------------------------
 
+
 def build_page_markdown(title: str, body: str, source_url: str) -> str:
     parts: list[str] = []
     if title:
@@ -743,8 +739,9 @@ def build_page_markdown(title: str, body: str, source_url: str) -> str:
 
 def build_manuals_readme(manuals: list[dict]) -> str:
     lines = ["# Keycloak Reference Manuals", ""]
-    lines.append("Monolithic reference documentation fetched from "
-                 f"[{SITE}/documentation]({SITE}/documentation).")
+    lines.append(
+        f"Monolithic reference documentation fetched from [{SITE}/documentation]({SITE}/documentation)."
+    )
     lines.append("")
     for m in manuals:
         lines.append(f"- [{m['title']}](./{m['slug']}.md)")
@@ -796,6 +793,7 @@ def build_top_readme(sections: dict[str, list[dict]], manuals: list[dict]) -> st
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def fetch_one_page(url: str) -> tuple[str, str | None]:
     return url, fetch_url(url)
 
@@ -806,27 +804,29 @@ def sync(args: argparse.Namespace) -> None:
     guide_urls = discover_urls()
     manual_jobs = list(MANUALS)
 
-    print(f"Fetching {len(guide_urls)} guide pages and "
-          f"{len(manual_jobs)} manuals (concurrency={MAX_WORKERS})...")
+    print(
+        f"Fetching {len(guide_urls)} guide pages and "
+        f"{len(manual_jobs)} manuals (concurrency={MAX_WORKERS})..."
+    )
 
-    fetched: dict[str, dict] = {}   # url -> {"kind", "html", "slug"?}
+    fetched: dict[str, dict] = {}  # url -> {"kind", "html", "slug"?}
     missing: list[str] = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {}
+        futures: dict[Future[tuple[str, str | None]], tuple[str, str, str | None]] = {}
         for u in guide_urls:
             futures[pool.submit(fetch_one_page, u)] = ("guide", u, None)
-        for slug, u in manual_jobs:
-            futures[pool.submit(fetch_one_page, u)] = ("manual", u, slug)
+        for manual_job_slug, u in manual_jobs:
+            futures[pool.submit(fetch_one_page, u)] = ("manual", u, manual_job_slug)
         for fut in as_completed(futures):
-            kind, url, slug = futures[fut]
+            kind, url, fetched_slug = futures[fut]
             _, html_content = fut.result()
             if html_content is None:
                 missing.append(url)
                 continue
             entry = {"kind": kind, "html": html_content}
-            if slug is not None:
-                entry["slug"] = slug
+            if fetched_slug is not None:
+                entry["slug"] = fetched_slug
             fetched[url] = entry
 
     print(f"  fetched: {len(fetched)}")
@@ -867,11 +867,13 @@ def sync(args: argparse.Namespace) -> None:
             rel_from_section = os.path.basename(out_path)
         else:
             rel_from_section = os.path.relpath(out_path, os.path.join(DOCS_DIR, section))
-        sections.setdefault(section, []).append({
-            "title": title,
-            "rel": rel_from_section.replace(os.sep, "/"),
-            "url": url,
-        })
+        sections.setdefault(section, []).append(
+            {
+                "title": title,
+                "rel": rel_from_section.replace(os.sep, "/"),
+                "url": url,
+            }
+        )
 
         prev = cache.get(cache_key, {})
         if prev.get("sha256") == page_hash and os.path.exists(out_path):
@@ -879,11 +881,12 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             continue
         is_new = cache_key not in cache or not os.path.exists(out_path)
-        write_file(out_path, page_md, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            out_path, page_md, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+        )
         new_cache[cache_key] = {
             "sha256": page_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
             "url": url,
             "title": title,
         }
@@ -917,11 +920,12 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             continue
         is_new = cache_key not in cache or not os.path.exists(out_path)
-        write_file(out_path, page_md, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            out_path, page_md, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+        )
         new_cache[cache_key] = {
             "sha256": page_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
             "url": url,
             "title": title,
         }
@@ -956,11 +960,13 @@ def sync(args: argparse.Namespace) -> None:
                 if section == "_root"
                 else os.path.relpath(out_path, os.path.join(DOCS_DIR, section))
             )
-            sections.setdefault(section, []).append({
-                "title": title,
-                "rel": rel_from_section.replace(os.sep, "/"),
-                "url": url,
-            })
+            sections.setdefault(section, []).append(
+                {
+                    "title": title,
+                    "rel": rel_from_section.replace(os.sep, "/"),
+                    "url": url,
+                }
+            )
             unchanged += 1
             new_cache[cache_key] = {
                 **prev,
@@ -969,10 +975,10 @@ def sync(args: argparse.Namespace) -> None:
             }
             continue
 
-        slug = manual_by_url.get(url)
-        if slug is None:
+        manual_slug = manual_by_url.get(url)
+        if manual_slug is None:
             continue
-        out_path = manual_path(slug)
+        out_path = manual_path(manual_slug)
         cache_key = os.path.relpath(out_path, DOCS_DIR)
         prev = cache.get(cache_key, {})
         if not prev or not os.path.exists(out_path):
@@ -984,8 +990,8 @@ def sync(args: argparse.Namespace) -> None:
                     title = f.readline().strip().removeprefix("# ").strip()
             except OSError:
                 title = ""
-        title = title or slug
-        manual_entries.append({"slug": slug, "title": title, "url": url})
+        title = title or manual_slug
+        manual_entries.append({"slug": manual_slug, "title": title, "url": url})
         unchanged += 1
         new_cache[cache_key] = {
             **prev,
@@ -1007,11 +1013,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             continue
         is_new = cache_key not in cache or not os.path.exists(readme_path)
-        write_file(readme_path, readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            readme_path,
+            readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": page_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -1030,11 +1041,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
         else:
             is_new = cache_key not in cache or not os.path.exists(path)
-            write_file(path, manuals_readme, dry_run=args.dry_run, verbose=args.verbose,
-                       label="ADD" if is_new else "UPDATE")
+            write_file(
+                path,
+                manuals_readme,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+                label="ADD" if is_new else "UPDATE",
+            )
             new_cache[cache_key] = {
                 "sha256": page_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -1052,11 +1068,16 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[top_key] = prev
     else:
         is_new = top_key not in cache or not os.path.exists(top_path)
-        write_file(top_path, top_readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            top_path,
+            top_readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[top_key] = {
             "sha256": top_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -1108,15 +1129,10 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Fetch Keycloak documentation and mirror as local markdown"
-    )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything, ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser = argparse.ArgumentParser(description="Fetch Keycloak documentation and mirror as local markdown")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything, ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

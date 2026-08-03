@@ -17,6 +17,14 @@
 # Python
 __pycache__/
 *.pyc
+.venv/
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# SentinelOne session cookies contain authentication material
+sentinelone/cookies.txt
 
 # Editor
 *.swp

@@ -20,7 +20,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -41,13 +42,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "discord-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "discord-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -63,8 +67,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -90,6 +94,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # Discovery
 # ---------------------------------------------------------------------------
 
+
 def parse_sitemap(xml: str) -> list[str]:
     """Extract all <loc> URLs from the sitemap."""
     return re.findall(r"<loc>([^<]+)</loc>", xml)
@@ -105,9 +110,7 @@ def parse_llms_index(text: str) -> tuple[list[tuple[str, str, str]], dict[str, s
     entries: list[tuple[str, str, str]] = []
     titles: dict[str, str] = {}
     section = ""
-    link_re = re.compile(
-        r"^- \[([^\]]+)\]\((https://docs\.discord\.com/developers/[^)]+?)\.md\)"
-    )
+    link_re = re.compile(r"^- \[([^\]]+)\]\((https://docs\.discord\.com/developers/[^)]+?)\.md\)")
     for line in text.splitlines():
         if line.startswith("## "):
             section = line[3:].strip()
@@ -143,7 +146,7 @@ def path_for(url: str) -> tuple[str, str, str]:
     a category landing page (e.g. /developers/activities/overview with no
     standalone /developers/activities) is stored normally.
     """
-    rel = url[len(f"{SITE}{DOCS_PREFIX}"):]
+    rel = url[len(f"{SITE}{DOCS_PREFIX}") :]
     parts = rel.split("/")
     if len(parts) == 1:
         category = "_root"
@@ -159,6 +162,7 @@ def path_for(url: str) -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 # Page formatting
 # ---------------------------------------------------------------------------
+
 
 def build_page_markdown(raw: str, title: str | None, source_url: str) -> str:
     """Normalize the fetched markdown and prepend a source link."""
@@ -187,10 +191,7 @@ def build_category_readme(category: str, pages: list[dict]) -> str:
     lines.append("")
     for p in sorted(pages, key=lambda x: x["subpath"]):
         subpath = p["subpath"]
-        if category == "_root":
-            link = subpath + ".md"
-        else:
-            link = subpath[len(category) + 1:] + ".md"
+        link = subpath + ".md" if category == "_root" else subpath[len(category) + 1 :] + ".md"
         lines.append(f"- [{p['title']}](./{link})")
     lines.append("")
     return "\n".join(lines)
@@ -215,6 +216,7 @@ def build_top_readme(categories: dict[str, list[dict]]) -> str:
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
+
 
 def discover_urls() -> tuple[list[str], dict[str, str]]:
     """Discover all docs URLs. Returns (urls, titles)."""
@@ -296,11 +298,13 @@ def sync(args: argparse.Namespace) -> None:
             title = m.group(1).strip() if m else subpath
         title = title or subpath
 
-        categories.setdefault(category, []).append({
-            "subpath": subpath,
-            "title": title,
-            "url": url,
-        })
+        categories.setdefault(category, []).append(
+            {
+                "subpath": subpath,
+                "title": title,
+                "url": url,
+            }
+        )
 
         if raw is None:
             if prev and os.path.exists(file_path):
@@ -330,7 +334,7 @@ def sync(args: argparse.Namespace) -> None:
         write_file(file_path, content, dry_run=args.dry_run, verbose=args.verbose, label=label)
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
             "title": title,
             "url": url,
         }
@@ -353,11 +357,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             continue
         is_new = cache_key not in cache or not os.path.exists(readme_path)
-        write_file(readme_path, readme_content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            readme_path,
+            readme_content,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -375,11 +384,16 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[top_key] = prev
     else:
         is_new = top_key not in cache or not os.path.exists(top_path)
-        write_file(top_path, top_readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            top_path,
+            top_readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[top_key] = {
             "sha256": top_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -392,13 +406,13 @@ def sync(args: argparse.Namespace) -> None:
         if old_key in new_cache:
             continue
         if old_key.startswith("__readme__/"):
-            name = old_key[len("__readme__/"):]
+            name = old_key[len("__readme__/") :]
             if name == "_top":
                 old_path = os.path.join(DOCS_DIR, "README.md")
             else:
                 old_path = os.path.join(DOCS_DIR, name, "README.md")
         elif old_key.startswith("_root/"):
-            name = old_key[len("_root/"):]
+            name = old_key[len("_root/") :]
             old_path = os.path.join(DOCS_DIR, "_root", name) + ".md"
         else:
             parts = old_key.split("/")
@@ -415,7 +429,7 @@ def sync(args: argparse.Namespace) -> None:
 
     # Prune empty directories bottom-up
     if not args.dry_run and os.path.isdir(DOCS_DIR):
-        for root, dirs, files in os.walk(DOCS_DIR, topdown=False):
+        for root, _dirs, _files in os.walk(DOCS_DIR, topdown=False):
             if root == DOCS_DIR:
                 continue
             if not os.listdir(root):
@@ -439,15 +453,10 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Fetch Discord developer docs and mirror to local markdown"
-    )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser = argparse.ArgumentParser(description="Fetch Discord developer docs and mirror to local markdown")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

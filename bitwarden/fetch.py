@@ -20,14 +20,12 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-CLI_SOURCE_URL = (
-    "https://raw.githubusercontent.com/bitwarden/help/master/"
-    "_articles/miscellaneous/cli.md"
-)
+CLI_SOURCE_URL = "https://raw.githubusercontent.com/bitwarden/help/master/_articles/miscellaneous/cli.md"
 API_PAGE_URL = "https://bitwarden.com/help/vault-management-api/"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -42,16 +40,19 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "bitwarden-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "bitwarden-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
-            return data.decode("utf-8")
+            return cast(str, data.decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -59,8 +60,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict[str, Any], json.load(f))
     return {}
 
 
@@ -69,13 +70,12 @@ def save_cache(cache: dict) -> None:
         json.dump(cache, f, indent=2, sort_keys=True)
 
 
-def write_file(path: str, content: str, args, cache: dict,
-               new_cache: dict, cache_key: str) -> None:
+def write_file(path: str, content: str, args, cache: dict, new_cache: dict, cache_key: str) -> None:
     """Write a file if content changed, respecting dry-run and cache."""
     content_hash = sha256(content)
     new_cache[cache_key] = {
         "sha256": content_hash,
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": datetime.now(UTC).isoformat(),
     }
     cached = cache.get(cache_key, {})
     if cached.get("sha256") == content_hash and os.path.exists(path):
@@ -92,9 +92,34 @@ def write_file(path: str, content: str, args, cache: dict,
         print(f"  WROTE: {path}")
 
 
+def cache_key_path(cache_key: str) -> str | None:
+    """Map a cache key to its generated output path."""
+    if cache_key == "cli":
+        return os.path.join(DOCS_DIR, "cli.md")
+    if cache_key == "api/README":
+        return os.path.join(API_DOCS_DIR, "README.md")
+    if not cache_key.startswith("api/"):
+        return None
+    relative = cache_key.removeprefix("api/")
+    if relative.endswith("/README"):
+        relative += ".md"
+    return os.path.join(API_DOCS_DIR, relative)
+
+
+def preserve_cached_scope(cache: dict, new_cache: dict, prefix: str) -> None:
+    """Carry forward cache entries whose source failed and output still exists."""
+    for key, entry in cache.items():
+        if key != prefix and not key.startswith(prefix + "/"):
+            continue
+        output_path = cache_key_path(key)
+        if output_path is not None and os.path.exists(output_path):
+            new_cache[key] = entry
+
+
 # ---------------------------------------------------------------------------
 # Jekyll markdown to clean markdown (CLI doc)
 # ---------------------------------------------------------------------------
+
 
 def strip_frontmatter(text: str) -> tuple[str, str]:
     """Remove YAML frontmatter. Returns (body, title)."""
@@ -106,7 +131,7 @@ def strip_frontmatter(text: str) -> tuple[str, str]:
             for line in fm.splitlines():
                 if line.startswith("title:"):
                     title = line.split(":", 1)[1].strip().strip('"')
-            text = text[end + 3:].lstrip("\n")
+            text = text[end + 3 :].lstrip("\n")
     return text, title
 
 
@@ -135,7 +160,9 @@ def clean_jekyll(text: str) -> str:
     text = re.sub(r"\{%\s*(?:raw|endraw)\s*%\}", "", text)
     text = re.sub(
         r"<ul[^>]*class=\"nav nav-tabs\"[^>]*>.*?</ul>",
-        "", text, flags=re.DOTALL,
+        "",
+        text,
+        flags=re.DOTALL,
     )
     text = re.sub(r"<div[^>]*class=\"tab-content\"[^>]*>", "", text)
     text = re.sub(r"<div[^>]*class=\"tab-pane[^\"]*\"[^>]*>", "", text)
@@ -159,6 +186,7 @@ def convert_cli(raw: str) -> str:
 # OpenAPI spec extraction and conversion (Vault Management API)
 # ---------------------------------------------------------------------------
 
+
 def extract_openapi_from_page(page_html: str) -> dict | None:
     """Extract the OpenAPI spec from the Inertia.js data-page attribute."""
     m = re.search(r'data-page="([^"]+)"', page_html)
@@ -169,12 +197,12 @@ def extract_openapi_from_page(page_html: str) -> dict | None:
     except (json.JSONDecodeError, ValueError):
         return None
 
-    def find_body(obj, depth=0):
+    def find_body(obj: object, depth: int = 0) -> object | None:
         if depth > 10:
             return None
         if isinstance(obj, dict):
             if obj.get("slug") == "vault-management-api" and "body" in obj:
-                return obj["body"]
+                return cast(object, obj["body"])
             for v in obj.values():
                 r = find_body(v, depth + 1)
                 if r is not None:
@@ -186,7 +214,7 @@ def extract_openapi_from_page(page_html: str) -> dict | None:
                     return r
         return None
 
-    return find_body(data)
+    return cast(dict[str, Any] | None, find_body(data))
 
 
 def resolve_ref(ref: str, spec: dict) -> dict:
@@ -202,7 +230,10 @@ def resolve_ref(ref: str, spec: dict) -> dict:
 
 
 def schema_to_markdown(
-    schema: dict, spec: dict, depth: int = 0, seen: set | None = None,
+    schema: dict,
+    spec: dict,
+    depth: int = 0,
+    seen: set | None = None,
 ) -> str:
     if seen is None:
         seen = set()
@@ -280,7 +311,7 @@ def schema_to_markdown(
             if len(enum) > 10:
                 enum_str += f", ... ({len(enum)} total)"
             result += f" - enum: {enum_str}"
-        return result
+        return cast(str, result)
 
     return "any"
 
@@ -301,12 +332,8 @@ def format_parameters(parameters: list[dict], spec: dict) -> str:
         if param_schema.get("format"):
             param_type += f" ({param_schema['format']})"
         required = "Yes" if param.get("required", False) else "No"
-        description = (
-            param.get("description", "").replace("\n", " ").replace("|", "\\|")
-        )
-        lines.append(
-            f"| `{name}` | {location} | {param_type} | {required} | {description} |"
-        )
+        description = param.get("description", "").replace("\n", " ").replace("|", "\\|")
+        lines.append(f"| `{name}` | {location} | {param_type} | {required} | {description} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -383,7 +410,10 @@ def endpoint_filename(method: str, path: str) -> str:
 
 
 def build_endpoint_markdown(
-    path: str, method: str, operation: dict, spec: dict,
+    path: str,
+    method: str,
+    operation: dict,
+    spec: dict,
 ) -> str:
     lines = []
     summary = operation.get("summary", f"{method.upper()} {path}")
@@ -457,13 +487,15 @@ def process_openapi(spec: dict, args, cache: dict, new_cache: dict) -> None:
             fname = endpoint_filename(method, path)
 
             for tag in tags:
-                tag_endpoints.setdefault(tag, []).append({
-                    "path": path,
-                    "method": method,
-                    "summary": summary,
-                    "filename": fname,
-                    "operation": operation,
-                })
+                tag_endpoints.setdefault(tag, []).append(
+                    {
+                        "path": path,
+                        "method": method,
+                        "summary": summary,
+                        "filename": fname,
+                        "operation": operation,
+                    }
+                )
 
     # Write per-tag directories and endpoint files
     for tag, endpoints in sorted(tag_endpoints.items()):
@@ -471,23 +503,32 @@ def process_openapi(spec: dict, args, cache: dict, new_cache: dict) -> None:
         tag_dir = os.path.join(API_DOCS_DIR, tag_slug)
 
         # Tag README
-        readme_content = build_tag_readme(
-            tag, tag_descs.get(tag, ""), endpoints
-        )
+        readme_content = build_tag_readme(tag, tag_descs.get(tag, ""), endpoints)
         readme_path = os.path.join(tag_dir, "README.md")
         write_file(
-            readme_path, readme_content, args, cache, new_cache,
+            readme_path,
+            readme_content,
+            args,
+            cache,
+            new_cache,
             f"api/{tag_slug}/README",
         )
 
         # Individual endpoint files
         for ep in endpoints:
             ep_content = build_endpoint_markdown(
-                ep["path"], ep["method"], ep["operation"], spec,
+                ep["path"],
+                ep["method"],
+                ep["operation"],
+                spec,
             )
             ep_path = os.path.join(tag_dir, ep["filename"])
             write_file(
-                ep_path, ep_content, args, cache, new_cache,
+                ep_path,
+                ep_content,
+                args,
+                cache,
+                new_cache,
                 f"api/{tag_slug}/{ep['filename']}",
             )
 
@@ -506,7 +547,11 @@ def process_openapi(spec: dict, args, cache: dict, new_cache: dict) -> None:
     top_readme = "\n".join(top_lines)
     write_file(
         os.path.join(API_DOCS_DIR, "README.md"),
-        top_readme, args, cache, new_cache, "api/README",
+        top_readme,
+        args,
+        cache,
+        new_cache,
+        "api/README",
     )
 
 
@@ -514,37 +559,44 @@ def process_openapi(spec: dict, args, cache: dict, new_cache: dict) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fetch Bitwarden CLI and Vault Management API documentation"
-    )
+    parser = argparse.ArgumentParser(description="Fetch Bitwarden CLI and Vault Management API documentation")
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Show what would change, write nothing",
     )
     parser.add_argument(
-        "--force", action="store_true",
+        "--force",
+        action="store_true",
         help="Ignore cache, regenerate everything",
     )
     parser.add_argument(
-        "--verbose", action="store_true",
+        "--verbose",
+        action="store_true",
         help="Per-file logging",
     )
     args = parser.parse_args()
 
     cache = {} if args.force else load_cache()
-    new_cache = {}
+    new_cache: dict[str, dict[str, str]] = {}
 
     # --- CLI doc ---
     print(f"Fetching CLI doc from {CLI_SOURCE_URL} ...")
     raw_cli = fetch_url(CLI_SOURCE_URL)
     if raw_cli is None:
         print("WARNING: Could not fetch CLI doc, skipping.", file=sys.stderr)
+        preserve_cached_scope(cache, new_cache, "cli")
     else:
         markdown = convert_cli(raw_cli)
         write_file(
             os.path.join(DOCS_DIR, "cli.md"),
-            markdown, args, cache, new_cache, "cli",
+            markdown,
+            args,
+            cache,
+            new_cache,
+            "cli",
         )
 
     # --- Vault Management API ---
@@ -552,6 +604,7 @@ def main():
     raw_page = fetch_url(API_PAGE_URL)
     if raw_page is None:
         print("WARNING: Could not fetch API page, skipping.", file=sys.stderr)
+        preserve_cached_scope(cache, new_cache, "api")
     else:
         spec = extract_openapi_from_page(raw_page)
         if spec is None:
@@ -559,6 +612,7 @@ def main():
                 "WARNING: Could not extract OpenAPI spec from page.",
                 file=sys.stderr,
             )
+            preserve_cached_scope(cache, new_cache, "api")
         else:
             # Save raw spec
             if not args.dry_run:
@@ -575,8 +629,14 @@ def main():
     new_keys = set(new_cache.keys())
     removed = old_keys - new_keys
     for key in sorted(removed):
-        old_path_hint = key.replace("/", os.sep)
-        print(f"  REMOVED from cache: {old_path_hint}")
+        output_path = cache_key_path(key)
+        if output_path is None or not os.path.exists(output_path):
+            continue
+        if args.dry_run:
+            print(f"  REMOVE: {output_path}")
+        else:
+            os.remove(output_path)
+            print(f"  REMOVED: {output_path}")
 
     if not args.dry_run:
         save_cache(new_cache)

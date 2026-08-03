@@ -7,7 +7,8 @@ import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -26,17 +27,20 @@ def sha256(content: str) -> str:
 
 def fetch_url(url: str, timeout: int = 30) -> str | None:
     """Fetch URL content. Returns None on failure."""
-    req = Request(url, headers={
-        "User-Agent": "sync-google-api-docs/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "sync-google-api-docs/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
-    except (HTTPError, URLError, TimeoutError, OSError) as e:
+    except (HTTPError, URLError, TimeoutError, OSError):
         return None
 
 
@@ -49,11 +53,10 @@ def api_id_to_filename(api_id: str) -> str:
     return api_id.replace(":", "-") + ".md"
 
 
-
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -69,8 +72,8 @@ def fetch_directory() -> list[dict]:
     if not raw:
         print("ERROR: Failed to fetch discovery directory", file=sys.stderr)
         sys.exit(1)
-    data = json.loads(raw)
-    return data.get("items", [])
+    data = cast(dict, json.loads(raw))
+    return cast(list[dict], data.get("items", []))
 
 
 def select_apis(items: list[dict]) -> dict[str, dict]:
@@ -112,7 +115,7 @@ def fetch_discovery_doc(item: dict, verbose: bool) -> tuple[str, str | None, dic
 def build_index(selected: dict[str, dict]) -> str:
     """Build the google-api-discovery.json index from selected APIs."""
     entries = []
-    for api_id, item in sorted(selected.items()):
+    for _api_id, item in sorted(selected.items()):
         url = item["discoveryRestUrl"]
         # Extract subdomain from URL
         subdomain = url.split("//")[1].split(".")[0] if "//" in url else ""
@@ -150,8 +153,7 @@ def sync(args: argparse.Namespace) -> None:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
-            pool.submit(fetch_discovery_doc, item, args.verbose): item["id"]
-            for item in selected.values()
+            pool.submit(fetch_discovery_doc, item, args.verbose): item["id"] for item in selected.values()
         }
         for future in as_completed(futures):
             api_id, content, item = future.result()
@@ -169,7 +171,8 @@ def sync(args: argparse.Namespace) -> None:
         filename = api_id_to_filename(api_id)
         filepath = os.path.join(DOCS_DIR, filename)
 
-        content, _ = results.get(api_id, (None, item))
+        result = results.get(api_id)
+        content = result[0] if result is not None else None
         if content is None:
             failed += 1
             # Preserve a last known-good result after a transient fetch
@@ -205,7 +208,7 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[api_id] = {
             "url": item["discoveryRestUrl"],
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
             "revision": revision,
         }
 
@@ -242,7 +245,7 @@ def sync(args: argparse.Namespace) -> None:
         save_cache(new_cache)
 
     # Summary
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {added}")
     print(f"  Updated:    {updated}")
     print(f"  Unchanged:  {unchanged}")
@@ -253,9 +256,7 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sync Google API discovery documents to .md files"
-    )
+    parser = argparse.ArgumentParser(description="Sync Google API discovery documents to .md files")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -266,9 +267,7 @@ def main():
         action="store_true",
         help="Re-download everything ignoring cache",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Detailed per-API logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-API logging")
     args = parser.parse_args()
     sync(args)
 

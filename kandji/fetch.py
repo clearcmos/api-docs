@@ -17,14 +17,14 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html import unescape
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 COLLECTION_URL = (
-    "https://api-docs.kandji.io/api/collections/15284493/TzCTZkBe"
-    "?segregateAuth=true&versionTag=latest"
+    "https://api-docs.kandji.io/api/collections/15284493/TzCTZkBe?segregateAuth=true&versionTag=latest"
 )
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
@@ -36,18 +36,22 @@ COLLECTION_FILE = os.path.join(SCRIPT_DIR, "collection.json")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "kandji-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "kandji-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -64,8 +68,8 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -78,6 +82,7 @@ def save_cache(cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # HTML-to-markdown conversion (stdlib only, regex-based)
 # ---------------------------------------------------------------------------
+
 
 def convert_html_table(html_table: str) -> str:
     """Convert an HTML table to a markdown table."""
@@ -144,12 +149,14 @@ def clean_html(html_text: str) -> str:
 # Postman collection -> markdown
 # ---------------------------------------------------------------------------
 
-def extract_url(url) -> str:
+
+def extract_url(url: Any) -> str:
     """Return a raw URL string from Postman's url field (may be str or dict)."""
     if isinstance(url, str):
         return url
     if isinstance(url, dict):
-        return url.get("raw", "")
+        raw = url.get("raw", "")
+        return raw if isinstance(raw, str) else ""
     return ""
 
 
@@ -279,7 +286,9 @@ def build_method_filename(item: dict) -> str:
     return f"{method}-{sanitize_filename(name)}.md"
 
 
-def build_folder_readme(folder_name: str, folder_desc: str, endpoints: list[dict], subfolders: list[str]) -> str:
+def build_folder_readme(
+    folder_name: str, folder_desc: str, endpoints: list[dict], subfolders: list[dict[str, str]]
+) -> str:
     """Build a README.md for a folder, listing sub-folders and endpoints."""
     lines = [f"# {folder_name}\n"]
 
@@ -299,7 +308,7 @@ def build_folder_readme(folder_name: str, folder_desc: str, endpoints: list[dict
             method = ep.get("request", {}).get("method", "GET").upper()
             name = ep.get("name", "Unnamed")
             filename = build_method_filename(ep)
-            url_raw = extract_url(ep.get("request", {}).get("url"))
+            extract_url(ep.get("request", {}).get("url"))
             lines.append(f"- [{method} {name}](./{filename})")
         lines.append("")
 
@@ -310,8 +319,10 @@ def build_folder_readme(folder_name: str, folder_desc: str, endpoints: list[dict
 # Recursive collection walker
 # ---------------------------------------------------------------------------
 
-def walk_folder(folder: dict, prefix: str, cache: dict, new_cache: dict,
-                args: argparse.Namespace, counters: dict) -> None:
+
+def walk_folder(
+    folder: dict, prefix: str, cache: dict, new_cache: dict, args: argparse.Namespace, counters: dict
+) -> None:
     """Recursively process a Postman folder, writing markdown files."""
     folder_name = folder.get("name", "unknown")
     folder_desc = folder.get("description", "")
@@ -338,8 +349,17 @@ def walk_folder(folder: dict, prefix: str, cache: dict, new_cache: dict,
     cache_key = f"folder:{rel_prefix}:README"
     content_hash = sha256(readme_content)
 
-    _write_file(readme_file, readme_content, cache_key, content_hash,
-                cache, new_cache, args, counters, f"{rel_prefix}/README.md")
+    _write_file(
+        readme_file,
+        readme_content,
+        cache_key,
+        content_hash,
+        cache,
+        new_cache,
+        args,
+        counters,
+        f"{rel_prefix}/README.md",
+    )
 
     # Write endpoint files
     for ep in endpoints:
@@ -349,17 +369,34 @@ def walk_folder(folder: dict, prefix: str, cache: dict, new_cache: dict,
         cache_key = f"folder:{rel_prefix}:{ep_filename}"
         content_hash = sha256(ep_content)
 
-        _write_file(ep_file, ep_content, cache_key, content_hash,
-                     cache, new_cache, args, counters, f"{rel_prefix}/{ep_filename}")
+        _write_file(
+            ep_file,
+            ep_content,
+            cache_key,
+            content_hash,
+            cache,
+            new_cache,
+            args,
+            counters,
+            f"{rel_prefix}/{ep_filename}",
+        )
 
     # Recurse into subfolders
     for sf in subfolders:
         walk_folder(sf, rel_prefix, cache, new_cache, args, counters)
 
 
-def _write_file(filepath: str, content: str, cache_key: str,
-                content_hash: str, cache: dict, new_cache: dict,
-                args: argparse.Namespace, counters: dict, display_path: str) -> None:
+def _write_file(
+    filepath: str,
+    content: str,
+    cache_key: str,
+    content_hash: str,
+    cache: dict,
+    new_cache: dict,
+    args: argparse.Namespace,
+    counters: dict,
+    display_path: str,
+) -> None:
     """Write a single file with cache-aware skip/add/update logic."""
     if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(filepath):
         counters["unchanged"] += 1
@@ -379,7 +416,7 @@ def _write_file(filepath: str, content: str, cache_key: str,
 
     new_cache[cache_key] = {
         "sha256": content_hash,
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": datetime.now(UTC).isoformat(),
     }
     if is_new:
         counters["added"] += 1
@@ -390,6 +427,7 @@ def _write_file(filepath: str, content: str, cache_key: str,
 # ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
+
 
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
@@ -435,8 +473,9 @@ def sync(args: argparse.Namespace) -> None:
             ep_file = os.path.join(DOCS_DIR, ep_filename)
             cache_key = f"root:{ep_filename}"
             content_hash = sha256(ep_content)
-            _write_file(ep_file, ep_content, cache_key, content_hash,
-                        cache, new_cache, args, counters, ep_filename)
+            _write_file(
+                ep_file, ep_content, cache_key, content_hash, cache, new_cache, args, counters, ep_filename
+            )
 
     # Write top-level README
     main_lines = [f"# {info.get('name', 'Kandji API Documentation')}\n"]
@@ -471,21 +510,20 @@ def sync(args: argparse.Namespace) -> None:
     for old_key in sorted(cache):
         if old_key not in new_cache:
             parts = old_key.split(":", 2)
-            if len(parts) == 3:
-                if parts[0] == "folder":
-                    old_path = os.path.join(DOCS_DIR, parts[1], parts[2])
-                elif parts[0] == "root":
-                    old_path = os.path.join(DOCS_DIR, parts[2])
+            if len(parts) == 3 and parts[0] == "folder":
+                old_path = os.path.join(DOCS_DIR, parts[1], parts[2])
+            elif len(parts) == 2 and parts[0] == "root":
+                old_path = os.path.join(DOCS_DIR, parts[1])
+            else:
+                continue
+            if os.path.exists(old_path):
+                if args.dry_run:
+                    print(f"  REMOVE {old_key}")
                 else:
-                    continue
-                if os.path.exists(old_path):
-                    if args.dry_run:
+                    os.remove(old_path)
+                    if args.verbose:
                         print(f"  REMOVE {old_key}")
-                    else:
-                        os.remove(old_path)
-                        if args.verbose:
-                            print(f"  REMOVE {old_key}")
-                    removed += 1
+                removed += 1
 
     # Clean empty directories
     if not args.dry_run:
@@ -496,7 +534,7 @@ def sync(args: argparse.Namespace) -> None:
         save_cache(new_cache)
 
     total_endpoints = _count_endpoints({"item": items})
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {counters['added']}")
     print(f"  Updated:    {counters['updated']}")
     print(f"  Unchanged:  {counters['unchanged']}")
@@ -518,7 +556,7 @@ def _count_endpoints(folder: dict) -> int:
 
 def _clean_empty_dirs(root: str) -> None:
     """Remove empty directories under root, bottom-up."""
-    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
         if dirpath == root:
             continue
         if not os.listdir(dirpath):

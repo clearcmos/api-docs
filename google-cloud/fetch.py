@@ -57,6 +57,7 @@ processes running -- they keep fetching and writing for minutes.
 """
 
 import argparse
+import contextlib
 import gzip
 import hashlib
 import html as html_lib
@@ -70,6 +71,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import cast
 from urllib.parse import urlsplit
 
 HOST = "docs.cloud.google.com"
@@ -82,9 +84,7 @@ CACHE_FILE = os.path.join(SCRIPT_DIR, ".cache.json")
 
 USER_AGENT = "google-cloud-docs-fetcher/1.0"
 
-SDK_REFERENCE_RE = re.compile(
-    r"^(?:java|nodejs|ruby|python|dotnet|php|cpp|go)/docs/reference(?:/|$)"
-)
+SDK_REFERENCE_RE = re.compile(r"^(?:java|nodejs|ruby|python|dotnet|php|cpp|go)/docs/reference(?:/|$)")
 
 # Retry schedule (seconds) for 429/5xx and transport errors.
 RETRY_DELAYS = (1, 3, 8, 20)
@@ -101,10 +101,8 @@ _SSL_CTX = ssl.create_default_context()
 def _connection(fresh: bool = False):
     conn = getattr(_tls, "conn", None)
     if fresh and conn is not None:
-        try:
+        with contextlib.suppress(OSError):
             conn.close()
-        except OSError:
-            pass
         conn = None
     if conn is None:
         conn = http.client.HTTPSConnection(HOST, 443, timeout=90, context=_SSL_CTX)
@@ -113,7 +111,7 @@ def _connection(fresh: bool = False):
 
 
 def _read_body(resp) -> bytes:
-    body = resp.read()
+    body: bytes = resp.read()
     if resp.getheader("Content-Encoding", "").lower() == "gzip":
         body = gzip.decompress(body)
     return body
@@ -131,11 +129,15 @@ def http_get(path: str, max_redirects: int = 4) -> tuple[int, bytes | None]:
     while True:
         conn = _connection(fresh=attempt > 0)
         try:
-            conn.request("GET", path, headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Encoding": "gzip",
-                "Accept": "*/*",
-            })
+            conn.request(
+                "GET",
+                path,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept-Encoding": "gzip",
+                    "Accept": "*/*",
+                },
+            )
             resp = conn.getresponse()
             status = resp.status
             if status in (301, 302, 303, 307, 308):
@@ -173,9 +175,7 @@ def http_get(path: str, max_redirects: int = 4) -> tuple[int, bytes | None]:
 # Sitemap discovery
 # ---------------------------------------------------------------------------
 
-URL_ENTRY_RE = re.compile(
-    r"<loc>([^<]+)</loc>\s*(?:<lastmod>([^<]+)</lastmod>)?", re.S
-)
+URL_ENTRY_RE = re.compile(r"<loc>([^<]+)</loc>\s*(?:<lastmod>([^<]+)</lastmod>)?", re.S)
 
 
 def fetch_sitemap_urls(verbose: bool) -> tuple[dict[str, str | None], bool]:
@@ -264,9 +264,7 @@ def plan_pages(args) -> tuple[list[tuple[str, str, str | None]], bool]:
         stripped = path.lstrip("/")
         if not args.include_sdk_reference and SDK_REFERENCE_RE.match(stripped):
             continue
-        if only and not any(
-            stripped == o or stripped.startswith(o + "/") for o in only
-        ):
+        if only and not any(stripped == o or stripped.startswith(o + "/") for o in only):
             continue
         if rel in seen_rels:
             continue
@@ -295,14 +293,34 @@ class DevsiteExtractor(html.parser.HTMLParser):
     """
 
     SKIP_TAGS = {
-        "style", "script", "noscript", "devsite-iframe", "iframe",
-        "devsite-toc", "devsite-content-footer", "devsite-thumb-rating",
-        "devsite-feedback", "devsite-llm-tools", "devsite-actions",
-        "button", "svg", "form", "devsite-feature-tooltip",
-        "devsite-page-rating", "devsite-animation", "devsite-dialog",
-        "video", "audio", "devsite-hats-survey", "devsite-nav-buttons",
-        "label", "select", "devsite-select", "devsite-language-selector",
-        "devsite-lightbox", "devsite-modal-dialog",
+        "style",
+        "script",
+        "noscript",
+        "devsite-iframe",
+        "iframe",
+        "devsite-toc",
+        "devsite-content-footer",
+        "devsite-thumb-rating",
+        "devsite-feedback",
+        "devsite-llm-tools",
+        "devsite-actions",
+        "button",
+        "svg",
+        "form",
+        "devsite-feature-tooltip",
+        "devsite-page-rating",
+        "devsite-animation",
+        "devsite-dialog",
+        "video",
+        "audio",
+        "devsite-hats-survey",
+        "devsite-nav-buttons",
+        "label",
+        "select",
+        "devsite-select",
+        "devsite-language-selector",
+        "devsite-lightbox",
+        "devsite-modal-dialog",
     }
 
     CHROME_DIV_CLASSES = {
@@ -317,9 +335,21 @@ class DevsiteExtractor(html.parser.HTMLParser):
     }
 
     NOTE_CLASSES = {
-        "note", "caution", "warning", "tip", "key-point", "key-term",
-        "objective", "success", "beta", "special", "important",
-        "deprecated", "dogfood", "preview", "experimental",
+        "note",
+        "caution",
+        "warning",
+        "tip",
+        "key-point",
+        "key-term",
+        "objective",
+        "success",
+        "beta",
+        "special",
+        "important",
+        "deprecated",
+        "dogfood",
+        "preview",
+        "experimental",
     }
 
     def __init__(self):
@@ -431,8 +461,14 @@ class DevsiteExtractor(html.parser.HTMLParser):
                 self._notes.append({"body_depth": self._body_depth, "tag": tag})
                 return
 
-        if tag in ("devsite-code", "devsite-selector", "devsite-expandable",
-                   "section", "devsite-tabs", "nav"):
+        if tag in (
+            "devsite-code",
+            "devsite-selector",
+            "devsite-expandable",
+            "section",
+            "devsite-tabs",
+            "nav",
+        ):
             return
 
         if tag == "pre":
@@ -487,16 +523,14 @@ class DevsiteExtractor(html.parser.HTMLParser):
             return
 
         if tag in ("strong", "b"):
-            inside_code = (self._pre_depth > 0
-                           or any(t.get("tag") == "code" for t in self._tag_stack))
+            inside_code = self._pre_depth > 0 or any(t.get("tag") == "code" for t in self._tag_stack)
             if not inside_code:
                 self._append_inline("**")
             self._tag_stack.append({"tag": "strong", "inside_code": inside_code})
             return
 
         if tag in ("em", "i"):
-            inside_code = (self._pre_depth > 0
-                           or any(t.get("tag") == "code" for t in self._tag_stack))
+            inside_code = self._pre_depth > 0 or any(t.get("tag") == "code" for t in self._tag_stack)
             if not inside_code:
                 self._append_inline("*")
             self._tag_stack.append({"tag": "em", "inside_code": inside_code})
@@ -543,10 +577,7 @@ class DevsiteExtractor(html.parser.HTMLParser):
                 self._list_stack.append(["ul", 0])
             self._list_stack[-1][1] += 1
             indent = "  " * (len(self._list_stack) - 1)
-            if self._list_stack[-1][0] == "ol":
-                marker = f"{self._list_stack[-1][1]}. "
-            else:
-                marker = "- "
+            marker = f"{self._list_stack[-1][1]}. " if self._list_stack[-1][0] == "ol" else "- "
             self._current_line = indent + marker
             return
 
@@ -586,7 +617,7 @@ class DevsiteExtractor(html.parser.HTMLParser):
         if tag in ("td", "th"):
             if self._in_table:
                 self._current_cell = []
-                self._cell_is_header = (tag == "th" or self._in_thead)
+                self._cell_is_header = tag == "th" or self._in_thead
                 self._cell_buffer_target = "cell"
                 try:
                     self._cell_colspan = int(a.get("colspan") or "1")
@@ -621,8 +652,14 @@ class DevsiteExtractor(html.parser.HTMLParser):
                 self._ensure_blank()
                 return
 
-        if tag in ("devsite-code", "devsite-selector", "devsite-expandable",
-                   "section", "devsite-tabs", "nav"):
+        if tag in (
+            "devsite-code",
+            "devsite-selector",
+            "devsite-expandable",
+            "section",
+            "devsite-tabs",
+            "nav",
+        ):
             return
 
         if tag == "pre":
@@ -723,11 +760,13 @@ class DevsiteExtractor(html.parser.HTMLParser):
                 text = re.sub(r"\s+", " ", text)
                 text = re.sub(r"(?: ?<br> ?)+", " <br> ", text)
                 text = re.sub(r"^<br> | <br>$", "", text).strip()
-                self._current_row.append({
-                    "text": text,
-                    "is_header": self._cell_is_header,
-                    "colspan": self._cell_colspan,
-                })
+                self._current_row.append(
+                    {
+                        "text": text,
+                        "is_header": self._cell_is_header,
+                        "colspan": self._cell_colspan,
+                    }
+                )
                 self._current_cell = []
                 self._cell_buffer_target = None
                 self._cell_colspan = 1
@@ -866,7 +905,7 @@ def extract_title(head_html: str) -> str:
     m = HEADLINE_RE.search(head_html)
     if m:
         try:
-            return json.loads(f'"{m.group(1)}"').strip()
+            return cast(str, json.loads(f'"{m.group(1)}"')).strip()
         except ValueError:
             pass
     m = TITLE_RE.search(head_html)
@@ -886,7 +925,7 @@ def html_to_markdown(page_html: str, source_url: str) -> str | None:
     title = extract_title(page_html[: m.start()])
     parser = DevsiteExtractor()
     try:
-        parser.feed(page_html[m.start():])
+        parser.feed(page_html[m.start() :])
         parser.close()
     except Exception:
         return None
@@ -955,10 +994,11 @@ def _process_batch(jobs: list) -> list:
 # Cache
 # ---------------------------------------------------------------------------
 
+
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -972,6 +1012,7 @@ def save_cache(cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # README
 # ---------------------------------------------------------------------------
+
 
 def build_top_readme(cache: dict, total: int) -> str:
     groups: dict[str, int] = {}
@@ -1005,6 +1046,7 @@ def build_top_readme(cache: dict, total: int) -> str:
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args) -> None:
     os.makedirs(DOCS_DIR, exist_ok=True)
     cache = load_cache()
@@ -1034,17 +1076,15 @@ def sync(args) -> None:
     def in_scope(rel: str) -> bool:
         if not args.include_sdk_reference and SDK_REFERENCE_RE.match(rel):
             return False
-        if not args.include_translations and translation_re.search(rel):
-            return False
-        return True
+        return not (not args.include_translations and translation_re.search(rel))
 
     if sitemap_complete and not (args.only or args.limit):
-        removals = [rel for rel in cache
-                    if rel != "README.md" and rel not in plan_rels
-                    and in_scope(rel)]
+        removals = [rel for rel in cache if rel != "README.md" and rel not in plan_rels and in_scope(rel)]
 
-    print(f"To fetch: {len(jobs)} (new or changed)  |  unchanged: "
-          f"{len(plan) - len(jobs)}  |  removals: {len(removals)}")
+    print(
+        f"To fetch: {len(jobs)} (new or changed)  |  unchanged: "
+        f"{len(plan) - len(jobs)}  |  removals: {len(removals)}"
+    )
 
     if args.dry_run:
         for rel in removals[:20]:
@@ -1081,9 +1121,12 @@ def sync(args) -> None:
         if now - last_report >= 10:
             rate = done / max(now - started, 1)
             eta = (len(jobs) - done) / max(rate, 0.1)
-            print(f"  {done}/{len(jobs)} pages  {rate:.0f}/s  "
-                  f"ETA {eta/60:.0f}m  (+{counts['added']} ~{counts['updated']} "
-                  f"={counts['unchanged']} !{len(failures)})", flush=True)
+            print(
+                f"  {done}/{len(jobs)} pages  {rate:.0f}/s  "
+                f"ETA {eta / 60:.0f}m  (+{counts['added']} ~{counts['updated']} "
+                f"={counts['unchanged']} !{len(failures)})",
+                flush=True,
+            )
             last_report = now
         if now - last_save >= 120:
             save_cache(cache)
@@ -1091,28 +1134,29 @@ def sync(args) -> None:
 
     if jobs:
         batch_size = 200
-        batches = [jobs[i:i + batch_size] for i in range(0, len(jobs), batch_size)]
-        print(f"Fetching with {args.procs} processes x {args.threads} threads "
-              f"({len(batches)} batches)")
+        batches = [jobs[i : i + batch_size] for i in range(0, len(jobs), batch_size)]
+        print(f"Fetching with {args.procs} processes x {args.threads} threads ({len(batches)} batches)")
         try:
             with ProcessPoolExecutor(
                 max_workers=args.procs,
-                initializer=_pool_init, initargs=(args.threads,),
+                initializer=_pool_init,
+                initargs=(args.threads,),
             ) as pool:
                 futures = [pool.submit(_process_batch, b) for b in batches]
                 for fut in as_completed(futures):
                     handle_results(fut.result())
 
                 # One retry round for transient failures.
-                retry = [(p, r, lm, cache.get(r, {}).get("sha256"))
-                         for (st, p, r, lm) in failures if st != "http404"]
+                retry = [
+                    (p, r, lm, cache.get(r, {}).get("sha256"))
+                    for (st, p, r, lm) in failures
+                    if st != "http404"
+                ]
                 if retry:
                     print(f"Retrying {len(retry)} failed pages")
                     failures.clear()
-                    retry_batches = [retry[i:i + 50] for i in range(0, len(retry), 50)]
-                    for fut in as_completed(
-                        [pool.submit(_process_batch, b) for b in retry_batches]
-                    ):
+                    retry_batches = [retry[i : i + 50] for i in range(0, len(retry), 50)]
+                    for fut in as_completed([pool.submit(_process_batch, b) for b in retry_batches]):
                         handle_results(fut.result())
         except KeyboardInterrupt:
             print("\nInterrupted; saving cache (rerun to resume)")
@@ -1137,14 +1181,15 @@ def sync(args) -> None:
     with open(os.path.join(DOCS_DIR, "README.md"), "w") as f:
         f.write(readme)
     cache["README.md"] = {
-        "sha256": hashlib.sha256(readme.encode()).hexdigest(), "lastmod": None,
+        "sha256": hashlib.sha256(readme.encode()).hexdigest(),
+        "lastmod": None,
     }
 
     save_cache(cache)
 
     elapsed = time.time() - started
     print()
-    print(f"Sync complete in {elapsed/60:.1f}m:")
+    print(f"Sync complete in {elapsed / 60:.1f}m:")
     print(f"  Added:     {counts['added']}")
     print(f"  Updated:   {counts['updated']}")
     print(f"  Unchanged: {len(plan) - len(jobs) + counts['unchanged']}")
@@ -1159,32 +1204,39 @@ def sync(args) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Mirror docs.cloud.google.com to local markdown")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show the fetch/removal plan without fetching pages")
-    parser.add_argument("--force", action="store_true",
-                        help="Refetch everything ignoring lastmod cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Per-file logging")
-    parser.add_argument("--procs", type=int,
-                        default=max(4, min(12, (os.cpu_count() or 8) // 2)),
-                        help="Worker processes (default: half the cores, max 12)")
-    parser.add_argument("--threads", type=int, default=12,
-                        help="Threads per worker process (default 12)")
-    parser.add_argument("--only", type=str, default="",
-                        help="Comma-separated URL path prefixes to include "
-                             "(e.g. compute,bigquery,sdk)")
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Cap the number of pages (testing)")
-    parser.add_argument("--include-sdk-reference", action="store_true",
-                        help="Also mirror {lang}/docs/reference/* per-class "
-                             "client-library pages (~410k extra pages)")
-    parser.add_argument("--include-translations", action="store_true",
-                        help="Also mirror ?hl=xx translated pages")
-    parser.add_argument("--sitemap-cache", action="store_true",
-                        help="Reuse .sitemap-pages.json instead of re-downloading "
-                             "the 60 sitemap shards (testing)")
+    parser = argparse.ArgumentParser(description="Mirror docs.cloud.google.com to local markdown")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show the fetch/removal plan without fetching pages"
+    )
+    parser.add_argument("--force", action="store_true", help="Refetch everything ignoring lastmod cache")
+    parser.add_argument("--verbose", action="store_true", help="Per-file logging")
+    parser.add_argument(
+        "--procs",
+        type=int,
+        default=max(4, min(12, (os.cpu_count() or 8) // 2)),
+        help="Worker processes (default: half the cores, max 12)",
+    )
+    parser.add_argument("--threads", type=int, default=12, help="Threads per worker process (default 12)")
+    parser.add_argument(
+        "--only",
+        type=str,
+        default="",
+        help="Comma-separated URL path prefixes to include (e.g. compute,bigquery,sdk)",
+    )
+    parser.add_argument("--limit", type=int, default=0, help="Cap the number of pages (testing)")
+    parser.add_argument(
+        "--include-sdk-reference",
+        action="store_true",
+        help="Also mirror {lang}/docs/reference/* per-class client-library pages (~410k extra pages)",
+    )
+    parser.add_argument(
+        "--include-translations", action="store_true", help="Also mirror ?hl=xx translated pages"
+    )
+    parser.add_argument(
+        "--sitemap-cache",
+        action="store_true",
+        help="Reuse .sitemap-pages.json instead of re-downloading the 60 sitemap shards (testing)",
+    )
     args = parser.parse_args()
     sync(args)
 

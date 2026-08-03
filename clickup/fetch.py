@@ -18,16 +18,18 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 # V3 spec is YAML-only; pyyaml is acceptable per project conventions.
+yaml_module: Any
 try:
-    import yaml
+    import yaml as yaml_module
 except ImportError:
-    yaml = None
+    yaml_module = None
 
 V2_SPEC_URL = "https://developer.clickup.com/openapi/clickup-api-v2-reference.json"
 V3_SPEC_URL = "https://developer.clickup.com/openapi/ClickUp_PUBLIC_API_V3.yaml"
@@ -89,37 +91,44 @@ SLUG_CATEGORY = {
 # Common helpers
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "clickup-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "clickup-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
-            return data.decode("utf-8")
+            return cast(str, data.decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
 
 
 def fetch_bytes(url: str, timeout: int = 60) -> bytes | None:
-    req = Request(url, headers={
-        "User-Agent": "clickup-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "clickup-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
-            return data
+            return cast(bytes, data)
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -133,8 +142,8 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict[str, Any], json.load(f))
     return {}
 
 
@@ -147,6 +156,7 @@ def save_cache(cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # OpenAPI helpers
 # ---------------------------------------------------------------------------
+
 
 def resolve_ref(ref: str, spec: dict) -> dict:
     """Resolve a $ref pointer like '#/components/schemas/Foo'."""
@@ -247,7 +257,7 @@ def schema_to_markdown(schema: dict, spec: dict, depth: int = 0, seen: set | Non
             if len(enum) > 10:
                 enum_str += f", ... ({len(enum)} total)"
             result += f" -- enum: {enum_str}"
-        return result
+        return cast(str, result)
 
     return "any"
 
@@ -409,15 +419,43 @@ def build_tag_readme(tag: str, tag_desc: str, endpoints: list[dict]) -> str:
 # HTML-to-Markdown converter
 # ---------------------------------------------------------------------------
 
+
 class ReadmeExtractor(html.parser.HTMLParser):
     """Extract main content from a Readme.io / ClickUp developer docs page."""
 
     BLOCK_TAGS = {
-        "p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
-        "ul", "ol", "li", "pre", "blockquote", "table", "thead",
-        "tbody", "tr", "th", "td", "hr", "br", "figure", "figcaption",
-        "details", "summary", "section", "article", "header", "footer",
-        "dl", "dt", "dd",
+        "p",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "pre",
+        "blockquote",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "th",
+        "td",
+        "hr",
+        "br",
+        "figure",
+        "figcaption",
+        "details",
+        "summary",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "dl",
+        "dt",
+        "dd",
     }
     INLINE_TAGS = {"a", "strong", "b", "em", "i", "code", "span", "img", "sup", "sub", "mark"}
     SKIP_TAGS = {"script", "style", "nav", "svg", "button", "iframe", "noscript"}
@@ -448,7 +486,7 @@ class ReadmeExtractor(html.parser.HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
         attr_dict = dict(attrs)
-        cls = attr_dict.get("class", "")
+        cls = attr_dict.get("class") or ""
 
         if tag == "title":
             self._in_title = True
@@ -466,10 +504,17 @@ class ReadmeExtractor(html.parser.HTMLParser):
 
         # Skip breadcrumbs, pagination, edit links, ToC, theme toggles
         skip_classes = [
-            "breadcrumbs", "pagination-nav", "theme-edit-this-page",
-            "table-of-contents", "tocCollapsible", "footer",
-            "rm-Header", "rm-Sidebar", "rm-TableOfContents",
-            "UpdatedAt", "PageThumbs",
+            "breadcrumbs",
+            "pagination-nav",
+            "theme-edit-this-page",
+            "table-of-contents",
+            "tocCollapsible",
+            "footer",
+            "rm-Header",
+            "rm-Sidebar",
+            "rm-TableOfContents",
+            "UpdatedAt",
+            "PageThumbs",
         ]
         if any(sc in cls for sc in skip_classes):
             self._skip_depth = 1
@@ -484,12 +529,14 @@ class ReadmeExtractor(html.parser.HTMLParser):
             return
 
         # Detect main content area -- article, main, or Readme.io content divs
-        if (tag == "article" or tag == "main" or
-                (tag == "div" and ("rm-Article" in cls or "content-body" in cls or "markdown-body" in cls))):
-            if not self._in_content:
-                self._in_content = True
-                self._content_depth = 1
-                return
+        if (
+            tag == "article"
+            or tag == "main"
+            or (tag == "div" and ("rm-Article" in cls or "content-body" in cls or "markdown-body" in cls))
+        ) and not self._in_content:
+            self._in_content = True
+            self._content_depth = 1
+            return
 
         if self._in_content:
             self._content_depth += 1
@@ -527,7 +574,7 @@ class ReadmeExtractor(html.parser.HTMLParser):
                 self._current_line += "`"
 
         elif tag == "a":
-            href = attr_dict.get("href", "")
+            href = attr_dict.get("href") or ""
             self._tag_stack.append({"tag": "a", "href": href})
             self._current_line += "["
 
@@ -613,7 +660,11 @@ class ReadmeExtractor(html.parser.HTMLParser):
             self._skip_depth = 0
             return
 
-        if (tag == "article" or tag == "main" or tag == "div") and self._in_content and self._content_depth == 1:
+        if (
+            (tag == "article" or tag == "main" or tag == "div")
+            and self._in_content
+            and self._content_depth == 1
+        ):
             self._flush_line()
             self._in_content = False
             self._content_depth = 0
@@ -747,10 +798,7 @@ class ReadmeExtractor(html.parser.HTMLParser):
 
     def handle_charref(self, name: str):
         try:
-            if name.startswith("x"):
-                char = chr(int(name[1:], 16))
-            else:
-                char = chr(int(name))
+            char = chr(int(name[1:], 16)) if name.startswith("x") else chr(int(name))
         except (ValueError, OverflowError):
             char = f"&#{name};"
         if self._in_code_block:
@@ -805,6 +853,7 @@ def html_to_markdown(html_content: str) -> tuple[str, str]:
 # Sitemap parsing
 # ---------------------------------------------------------------------------
 
+
 def parse_sitemap(xml_content: str) -> list[str]:
     """Extract URLs from a sitemap XML."""
     urls = []
@@ -836,6 +885,7 @@ def classify_docs_url(url: str) -> tuple[str, str] | None:
 # Sync: OpenAPI specs
 # ---------------------------------------------------------------------------
 
+
 def sync_api(
     spec: dict,
     api_dir: str,
@@ -866,13 +916,15 @@ def sync_api(
             for tag in tags:
                 if tag not in endpoints_by_tag:
                     endpoints_by_tag[tag] = []
-                endpoints_by_tag[tag].append({
-                    "path": path,
-                    "method": method,
-                    "summary": summary,
-                    "filename": filename,
-                    "operation": operation,
-                })
+                endpoints_by_tag[tag].append(
+                    {
+                        "path": path,
+                        "method": method,
+                        "summary": summary,
+                        "filename": filename,
+                        "operation": operation,
+                    }
+                )
 
     if not args.dry_run:
         os.makedirs(api_dir, exist_ok=True)
@@ -911,7 +963,7 @@ def sync_api(
                     print(f"  {'ADD' if is_new else 'UPDATE'} {rel}/{safe_tag}/README.md")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -940,7 +992,7 @@ def sync_api(
                         print(f"  {'ADD' if is_new else 'UPDATE'} {rel}/{safe_tag}/{ep['filename']}")
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -999,6 +1051,7 @@ def sync_api(
 # Sync: guide pages
 # ---------------------------------------------------------------------------
 
+
 def _fetch_doc_page(url: str) -> tuple[str, str | None]:
     """Fetch a single doc page.  Returns (url, html_or_none)."""
     html_content = fetch_url(url)
@@ -1035,6 +1088,32 @@ def sync_guides(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple
     unchanged = 0
     categories: dict[str, list[tuple[str, str, str]]] = {}  # category -> [(filename, title, slug)]
 
+    def preserve_cached_guide(url: str) -> bool:
+        result = classify_docs_url(url)
+        if result is None:
+            return False
+        category, slug = result
+        safe_slug = sanitize_filename(slug)
+        filename = f"{safe_slug}.md"
+        cache_key = f"guides:{category}:{filename}"
+        target_path = os.path.join(GUIDES_DIR, category, filename)
+        if cache_key not in cache or not os.path.exists(target_path):
+            return False
+        title = safe_slug
+        try:
+            with open(target_path) as f:
+                first_line = f.readline().strip()
+            if first_line.startswith("# "):
+                title = first_line[2:].strip()
+        except OSError:
+            return False
+        new_cache[cache_key] = cache[cache_key]
+        categories.setdefault(category, []).append((filename, title, safe_slug))
+        return True
+
+    for url in sorted(set(doc_urls) - set(fetched)):
+        preserve_cached_guide(url)
+
     for url in sorted(fetched.keys()):
         result = classify_docs_url(url)
         if result is None:
@@ -1043,6 +1122,7 @@ def sync_guides(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple
 
         title, markdown = html_to_markdown(fetched[url])
         if not markdown.strip():
+            preserve_cached_guide(url)
             if args.verbose:
                 print(f"  SKIP guides/{category}/{slug} (empty content)")
             continue
@@ -1077,7 +1157,7 @@ def sync_guides(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple
                     print(f"  {'ADD' if is_new else 'UPDATE'} guides/{category}/{filename}")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -1108,7 +1188,7 @@ def sync_guides(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple
                     f.write(readme_content)
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -1155,6 +1235,7 @@ def sync_guides(cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple
 # Main sync orchestrator
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
     new_cache: dict = {}
@@ -1185,7 +1266,7 @@ def sync(args: argparse.Namespace) -> None:
 
     # --- V3 API (YAML) ---
     print("\nFetching ClickUp API V3 spec (YAML)...")
-    if yaml is None:
+    if yaml_module is None:
         print("WARNING: pyyaml not installed, skipping V3 spec.", file=sys.stderr)
         print("  Install with: pip install pyyaml", file=sys.stderr)
         v3_a = v3_u = v3_n = v3_r = 0
@@ -1196,7 +1277,7 @@ def sync(args: argparse.Namespace) -> None:
             sys.exit(1)
 
         v3_raw = v3_raw_bytes.decode("utf-8")
-        v3_spec = yaml.safe_load(v3_raw)
+        v3_spec = yaml_module.safe_load(v3_raw)
         print(f"  OpenAPI version: {v3_spec.get('openapi', '?')}")
         print(f"  API version: {v3_spec.get('info', {}).get('version', '?')}")
         print(f"  Paths: {len(v3_spec.get('paths', {}))}")
@@ -1233,7 +1314,7 @@ def sync(args: argparse.Namespace) -> None:
     total_n = v2_n + v3_n + g_n
     total_r = v2_r + v3_r + g_r
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:     {total_a}")
     print(f"  Updated:   {total_u}")
     print(f"  Unchanged: {total_n}")
@@ -1254,9 +1335,7 @@ def main():
         action="store_true",
         help="Re-generate everything ignoring cache",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Detailed per-file logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

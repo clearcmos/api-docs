@@ -44,7 +44,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -77,13 +78,12 @@ NESTED_OPTION_NAMESPACES = {"services", "programs"}
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def fetch_url(
-    url: str, timeout: int = 180, etag: str | None = None
-) -> tuple[str | None, str | None, bool]:
+def fetch_url(url: str, timeout: int = 180, etag: str | None = None) -> tuple[str | None, str | None, bool]:
     headers = {
         "User-Agent": "nixos-docs-fetcher/1.0",
         "Accept": "text/html,application/xhtml+xml,*/*",
@@ -114,8 +114,8 @@ def fetch_url(
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -160,6 +160,7 @@ def absolutize(url: str) -> str:
 # HTML to markdown converter
 # ---------------------------------------------------------------------------
 
+
 class NixOSHTMLRenderer(html.parser.HTMLParser):
     """Render a DocBook-rendered XHTML fragment to markdown.
 
@@ -173,7 +174,13 @@ class NixOSHTMLRenderer(html.parser.HTMLParser):
     measuring the depth of the outermost heading and adjusting.
     """
 
-    ADMONITIONS = {"note": "Note", "warning": "Warning", "tip": "Tip", "caution": "Caution", "important": "Important"}
+    ADMONITIONS = {
+        "note": "Note",
+        "warning": "Warning",
+        "tip": "Tip",
+        "caution": "Caution",
+        "important": "Important",
+    }
 
     def __init__(self, base_heading_level: int = 1):
         super().__init__(convert_charrefs=True)
@@ -207,7 +214,7 @@ class NixOSHTMLRenderer(html.parser.HTMLParser):
         self._code_filename_depth = 0
 
         # Lists.
-        self._list_types: list[str] = []   # "ul" / "ol"
+        self._list_types: list[str] = []  # "ul" / "ol"
         self._list_counters: list[int] = []
 
         # Definition list (<dl class="variablelist">) state.
@@ -247,7 +254,7 @@ class NixOSHTMLRenderer(html.parser.HTMLParser):
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         cls = a.get("class") or ""
-        tid = a.get("id") or ""
+        a.get("id") or ""
         cls_set = set(cls.split())
 
         if tag == "div":
@@ -260,16 +267,24 @@ class NixOSHTMLRenderer(html.parser.HTMLParser):
 
         # Skip TOC blocks and nav chrome. titlepage is NOT skipped because
         # nested section headings live inside it.
-        if tag == "div" and ("toc" in cls_set or "navheader" in cls_set
-                             or "navfooter" in cls_set or "list-of-examples" in cls_set):
+        if tag == "div" and (
+            "toc" in cls_set
+            or "navheader" in cls_set
+            or "navfooter" in cls_set
+            or "list-of-examples" in cls_set
+        ):
             self._skip = 1
             self._skip_tag = "div"
             return
 
         # Track section nesting so heading levels can be computed correctly.
-        if tag == "div" and ("section" in cls_set or "chapter" in cls_set
-                             or "appendix" in cls_set or "preface" in cls_set
-                             or "part" in cls_set):
+        if tag == "div" and (
+            "section" in cls_set
+            or "chapter" in cls_set
+            or "appendix" in cls_set
+            or "preface" in cls_set
+            or "part" in cls_set
+        ):
             self._section_depth += 1
             self._struct_stack.append(self._div_depth)
 
@@ -485,9 +500,18 @@ class NixOSHTMLRenderer(html.parser.HTMLParser):
                     self._output.append("")
                 lang = self._code_lang.strip()
                 # Map nixos-render-docs language hints to fenced-block hints.
-                lang_map = {"nix": "nix", "bash": "bash", "sh": "sh", "shell": "shell",
-                            "ShellSession": "shell", "json": "json", "py": "python",
-                            "yaml": "yaml", "sql": "sql", "plain": ""}
+                lang_map = {
+                    "nix": "nix",
+                    "bash": "bash",
+                    "sh": "sh",
+                    "shell": "shell",
+                    "ShellSession": "shell",
+                    "json": "json",
+                    "py": "python",
+                    "yaml": "yaml",
+                    "sql": "sql",
+                    "plain": "",
+                }
                 lang = lang_map.get(lang, lang)
                 self._output.append(f"```{lang}".rstrip())
                 body = self._code_buf.rstrip("\n")
@@ -608,16 +632,12 @@ class NixOSHTMLRenderer(html.parser.HTMLParser):
             # Decrement section_depth on structural-div close. Best-effort:
             # we don't track which class each open belonged to, so we rely on
             # symmetric increments. Stop at zero to avoid going negative.
-            if self._section_depth > 0:
-                # Only decrement when this </div> closes a structural div we
-                # incremented for. We can't fully verify without a stack, but
-                # since increments and div_depth are 1:1 paired, mirroring on
-                # close is safe as long as we only decrement on the matching
-                # structural close. To keep this simple we maintain a parallel
-                # bool stack (_struct_stack).
-                if self._struct_stack and self._struct_stack[-1] == self._div_depth:
-                    self._struct_stack.pop()
-                    self._section_depth -= 1
+            # Only decrement when this </div> closes a structural div we
+            # incremented for. The parallel stack identifies that matching
+            # structural close.
+            if self._section_depth > 0 and self._struct_stack and self._struct_stack[-1] == self._div_depth:
+                self._struct_stack.pop()
+                self._section_depth -= 1
             self._div_depth -= 1
             return
 
@@ -711,6 +731,7 @@ def html_to_markdown(html_fragment: str, base_heading_level: int = 1) -> str:
 # HTML slicing
 # ---------------------------------------------------------------------------
 
+
 class StructureSlicer(html.parser.HTMLParser):
     """First-pass parser that extracts the byte ranges of every top-level
     structural chunk on a manual page.
@@ -753,15 +774,17 @@ class StructureSlicer(html.parser.HTMLParser):
             cls = (a.get("class") or "").split()
             for kind in self.INTERESTING:
                 if kind in cls:
-                    self._stack.append({
-                        "kind": kind,
-                        "start": self.getpos_offset(),  # offset of "<div"
-                        "div_depth": self._div_depth,
-                        "id": "",
-                        "title": "",
-                        "heading_level": 0,
-                        "parent_part_id": self._current_part_id,
-                    })
+                    self._stack.append(
+                        {
+                            "kind": kind,
+                            "start": self.getpos_offset(),  # offset of "<div"
+                            "div_depth": self._div_depth,
+                            "id": "",
+                            "title": "",
+                            "heading_level": 0,
+                            "parent_part_id": self._current_part_id,
+                        }
+                    )
                     break
             return
         if tag in ("h1", "h2", "h3", "h4", "h5", "h6") and self._stack:
@@ -789,15 +812,17 @@ class StructureSlicer(html.parser.HTMLParser):
                 top = self._stack.pop()
                 # Ending offset is just after the </div>.
                 end = self.getpos_offset_after_close()
-                self._chunks.append({
-                    "kind": top["kind"],
-                    "id": top["id"],
-                    "title": top["title"],
-                    "html": self._src[top["start"]:end],
-                    "depth": top["div_depth"],
-                    "heading_level": top["heading_level"],
-                    "parent_part_id": top["parent_part_id"],
-                })
+                self._chunks.append(
+                    {
+                        "kind": top["kind"],
+                        "id": top["id"],
+                        "title": top["title"],
+                        "html": self._src[top["start"] : end],
+                        "depth": top["div_depth"],
+                        "heading_level": top["heading_level"],
+                        "parent_part_id": top["parent_part_id"],
+                    }
+                )
             self._div_depth -= 1
 
     def handle_data(self, data):
@@ -863,8 +888,7 @@ def slice_manual(html_text: str) -> dict:
         if c["kind"] == "preface":
             preface = {"id": c["id"], "title": c["title"], "html": c["html"]}
         elif c["kind"] == "part":
-            parts[c["id"]] = {"id": c["id"], "title": c["title"],
-                              "html": c["html"], "chapters": []}
+            parts[c["id"]] = {"id": c["id"], "title": c["title"], "html": c["html"], "chapters": []}
 
     extras: list[dict] = []
     chapters_in_parts: dict[str, list[dict]] = {}
@@ -911,6 +935,7 @@ def slice_release_notes(html_text: str) -> list[dict]:
 # Options page parsing
 # ---------------------------------------------------------------------------
 
+
 class OptionsParser(html.parser.HTMLParser):
     """Streaming parser for the /options page.
 
@@ -930,11 +955,11 @@ class OptionsParser(html.parser.HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=False)
         self._in_dl = False
-        self._dl_depth = 0          # variablelist nesting depth
-        self._inner_dl_depth = 0    # depth of plain <dl> nested inside dt/dd
+        self._dl_depth = 0  # variablelist nesting depth
+        self._inner_dl_depth = 0  # depth of plain <dl> nested inside dt/dd
         self._dt_html = ""
         self._dd_html = ""
-        self._mode: str | None = None   # "dt" or "dd" or None
+        self._mode: str | None = None  # "dt" or "dd" or None
         self._options: list[dict] = []
         # Best-effort name pickup from the anchor id (always present and reliable).
         self._anchor_name: str | None = None
@@ -1041,11 +1066,13 @@ class OptionsParser(html.parser.HTMLParser):
 
     def _flush_pair(self):
         if self._anchor_name and self._dd_html:
-            self._options.append({
-                "name": html_module.unescape(self._anchor_name),
-                "dt_html": self._dt_html,
-                "dd_html": self._dd_html,
-            })
+            self._options.append(
+                {
+                    "name": html_module.unescape(self._anchor_name),
+                    "dt_html": self._dt_html,
+                    "dd_html": self._dd_html,
+                }
+            )
         self._anchor_name = None
         self._dt_html = ""
         self._dd_html = ""
@@ -1093,17 +1120,22 @@ def render_option_md(opt: dict) -> str:
 # README builders
 # ---------------------------------------------------------------------------
 
+
 def build_top_readme(manual_index: dict, release_count: int, option_groups: list[str]) -> str:
     lines = ["# NixOS Manual (stable)", ""]
-    lines.append(f"Mirror of [{BASE}]({BASE}). Each chapter / option group / "
-                 "release note is stored as its own markdown file so that "
-                 "incremental syncs report exactly what changed.")
+    lines.append(
+        f"Mirror of [{BASE}]({BASE}). Each chapter / option group / "
+        "release note is stored as its own markdown file so that "
+        "incremental syncs report exactly what changed."
+    )
     lines.append("")
     lines.append("## Sections")
     lines.append("")
     lines.append("- [Manual](./manual/) -- preface, installation, configuration, administration, development")
     lines.append(f"- [Release Notes](./release-notes/) -- {release_count} releases")
-    lines.append(f"- [Options](./options/) -- {len(option_groups)} groups, including services/* and programs/*")
+    lines.append(
+        f"- [Options](./options/) -- {len(option_groups)} groups, including services/* and programs/*"
+    )
     lines.append("")
     return "\n".join(lines)
 
@@ -1187,6 +1219,7 @@ def build_chapter_md(chunk: dict, source_url: str) -> str:
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
     new_cache: dict[str, dict] = {}
@@ -1206,11 +1239,12 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[rel_path] = prev
             return
         is_new = rel_path not in cache or not os.path.exists(path)
-        write_file(path, content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            path, content, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+        )
         new_cache[rel_path] = {
             "sha256": digest,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
             "label": label_for_log,
         }
         (added if is_new else updated).append(f"{label_for_log} ({rel_path})")
@@ -1229,20 +1263,13 @@ def sync(args: argparse.Namespace) -> None:
             slug = futures[future]
             source_results[slug] = future.result()
 
-    if any(text is None and not unchanged_source
-           for text, _, unchanged_source in source_results.values()):
-        print("ERROR: one or more source pages could not be fetched",
-              file=sys.stderr)
+    if any(text is None and not unchanged_source for text, _, unchanged_source in source_results.values()):
+        print("ERROR: one or more source pages could not be fetched", file=sys.stderr)
         sys.exit(1)
 
-    output_entries = {
-        key: value for key, value in cache.items()
-        if not key.startswith(SOURCE_CACHE_PREFIX)
-    }
-    outputs_complete = (
-        bool(output_entries)
-        and all(os.path.exists(os.path.join(DOCS_DIR, key))
-                for key in output_entries)
+    output_entries = {key: value for key, value in cache.items() if not key.startswith(SOURCE_CACHE_PREFIX)}
+    outputs_complete = bool(output_entries) and all(
+        os.path.exists(os.path.join(DOCS_DIR, key)) for key in output_entries
     )
     if (
         len(source_results) == len(PAGES)
@@ -1260,17 +1287,11 @@ def sync(args: argparse.Namespace) -> None:
     # If one source changed, fetch bodies for the 304 sources too so the
     # cross-source indexes can be rebuilt consistently. Also repairs a
     # missing generated file when all sources returned 304.
-    missing_bodies = [
-        slug for slug, (text, _, _) in source_results.items() if text is None
-    ]
+    missing_bodies = [slug for slug, (text, _, _) in source_results.items() if text is None]
     if missing_bodies:
-        print(f"  Refetching {len(missing_bodies)} unchanged source bodies "
-              "for a complete rebuild...")
+        print(f"  Refetching {len(missing_bodies)} unchanged source bodies for a complete rebuild...")
         with ThreadPoolExecutor(max_workers=len(missing_bodies)) as pool:
-            futures = {
-                pool.submit(fetch_url, PAGES[slug]): slug
-                for slug in missing_bodies
-            }
+            futures = {pool.submit(fetch_url, PAGES[slug]): slug for slug in missing_bodies}
             for future in as_completed(futures):
                 slug = futures[future]
                 source_results[slug] = future.result()
@@ -1315,8 +1336,7 @@ def sync(args: argparse.Namespace) -> None:
             rel = f"manual/{dirname}/{slug}.md"
             md = build_chapter_md(ch, PAGES["manual"])
             commit(rel, md, f"{part['title']} / {ch['title']}")
-        commit(f"manual/{dirname}/README.md", build_part_readme(part, dirname),
-               f"{part['title']} index")
+        commit(f"manual/{dirname}/README.md", build_part_readme(part, dirname), f"{part['title']} index")
 
     # Extras (Contributing chapter, etc).
     for ex in manual["extras"]:
@@ -1334,8 +1354,7 @@ def sync(args: argparse.Namespace) -> None:
         slug = slugify(r["id"])
         md = build_chapter_md(r, PAGES["release-notes"])
         commit(f"release-notes/{slug}.md", md, r["title"])
-    commit("release-notes/README.md", build_release_readme(releases),
-           "Release notes index")
+    commit("release-notes/README.md", build_release_readme(releases), "Release notes index")
 
     # --- Options -------------------------------------------------------
     print("\nParsing options page...")
@@ -1369,17 +1388,21 @@ def sync(args: argparse.Namespace) -> None:
     # Per-subdir READMEs.
     for dirname, files in group_summary.items():
         if dirname:
-            commit(f"options/{dirname}/README.md",
-                   build_options_subdir_readme(dirname, files),
-                   f"options.{dirname} index")
+            commit(
+                f"options/{dirname}/README.md",
+                build_options_subdir_readme(dirname, files),
+                f"options.{dirname} index",
+            )
 
-    commit("options/README.md", build_options_readme(group_summary),
-           "Options index")
+    commit("options/README.md", build_options_readme(group_summary), "Options index")
 
     # --- Top-level README ---------------------------------------------
     n_groups = sum(len(g) for g in group_summary.values())
-    commit("README.md", build_top_readme(manual, len(releases), [str(i) for i in range(n_groups)]),
-           "Top-level index")
+    commit(
+        "README.md",
+        build_top_readme(manual, len(releases), [str(i) for i in range(n_groups)]),
+        "Top-level index",
+    )
 
     # --- Detect removals -----------------------------------------------
     for old_key in sorted(cache):
@@ -1435,12 +1458,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch the NixOS stable manual and mirror it as local markdown"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything, ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything, ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

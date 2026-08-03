@@ -24,6 +24,7 @@ unchanged pages answer 304 and the recorded outputs are kept as-is.
 
 import argparse
 import concurrent.futures
+import contextlib
 import gzip
 import hashlib
 import json
@@ -31,7 +32,8 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import NoReturn
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -129,8 +131,9 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -143,7 +146,7 @@ def save_cache(cache: dict) -> None:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +158,7 @@ def now_iso() -> str:
 # literals, dotted identifiers and _jsx calls) is small enough to parse
 # directly, which preserves the original markdown structure exactly.
 # ---------------------------------------------------------------------------
+
 
 class MdxParseError(Exception):
     pass
@@ -181,9 +185,20 @@ class El:
 
 
 ESCAPES = {
-    '"': '"', "'": "'", "\\": "\\", "/": "/", "`": "`",
-    "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
-    "0": "\0", "\n": "", "\r": "",
+    '"': '"',
+    "'": "'",
+    "\\": "\\",
+    "/": "/",
+    "`": "`",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "0": "\0",
+    "\n": "",
+    "\r": "",
 }
 
 
@@ -197,8 +212,8 @@ class JsExpr:
         self.s = src
         self.i = pos
 
-    def fail(self, msg: str):
-        context = self.s[max(0, self.i - 40):self.i + 40]
+    def fail(self, msg: str) -> NoReturn:
+        context = self.s[max(0, self.i - 40) : self.i + 40]
         raise MdxParseError(f"{msg} at offset {self.i}: {context!r}")
 
     def ws(self):
@@ -257,15 +272,15 @@ class JsExpr:
                     self.fail("unterminated escape")
                 e = self.s[self.i]
                 if e == "u":
-                    if self.s[self.i + 1:self.i + 2] == "{":
+                    if self.s[self.i + 1 : self.i + 2] == "{":
                         end = self.s.index("}", self.i)
-                        out.append(chr(int(self.s[self.i + 2:end], 16)))
+                        out.append(chr(int(self.s[self.i + 2 : end], 16)))
                         self.i = end + 1
                     else:
-                        out.append(chr(int(self.s[self.i + 1:self.i + 5], 16)))
+                        out.append(chr(int(self.s[self.i + 1 : self.i + 5], 16)))
                         self.i += 5
                 elif e == "x":
-                    out.append(chr(int(self.s[self.i + 1:self.i + 3], 16)))
+                    out.append(chr(int(self.s[self.i + 1 : self.i + 3], 16)))
                     self.i += 3
                 else:
                     out.append(ESCAPES.get(e, e))
@@ -281,10 +296,8 @@ class JsExpr:
     def _join_surrogates(chunks: list[str]) -> str:
         text = "".join(chunks)
         if any(0xD800 <= ord(ch) <= 0xDFFF for ch in text):
-            try:
+            with contextlib.suppress(UnicodeError):
                 text = text.encode("utf-16", "surrogatepass").decode("utf-16")
-            except UnicodeError:
-                pass
         return text
 
     def number(self):
@@ -397,8 +410,23 @@ def parse_compiled_mdx(compiled: str) -> El:
 # ---------------------------------------------------------------------------
 
 INLINE_TAGS = {
-    "a", "code", "strong", "b", "em", "i", "del", "s", "br", "input", "img",
-    "span", "sup", "sub", "kbd", "abbr", "CH.SectionLink",
+    "a",
+    "code",
+    "strong",
+    "b",
+    "em",
+    "i",
+    "del",
+    "s",
+    "br",
+    "input",
+    "img",
+    "span",
+    "sup",
+    "sub",
+    "kbd",
+    "abbr",
+    "CH.SectionLink",
 }
 LIST_START_RE = re.compile(r"[ \t]*(?:[-*+] |\d+\. )")
 CHECKBOX_RE = re.compile(r"^\[([ xX])\]\s*")
@@ -416,8 +444,8 @@ def emphasis(text: str, marker: str) -> str:
     stripped = text.strip()
     if not stripped:
         return text
-    lead = text[:len(text) - len(text.lstrip())]
-    trail = text[len(text.rstrip()):]
+    lead = text[: len(text) - len(text.lstrip())]
+    trail = text[len(text.rstrip()) :]
     return f"{lead}{marker}{stripped}{marker}{trail}"
 
 
@@ -575,12 +603,9 @@ class MdxRenderer:
                     continue
                 if child.tag == "tr":
                     cells = [
-                        self.cell(c) for c in child.children
-                        if isinstance(c, El) and c.tag in ("td", "th")
+                        self.cell(c) for c in child.children if isinstance(c, El) and c.tag in ("td", "th")
                     ]
-                    is_header = any(
-                        isinstance(c, El) and c.tag == "th" for c in child.children
-                    )
+                    is_header = any(isinstance(c, El) and c.tag == "th" for c in child.children)
                     if is_header and header is None and not rows:
                         header = cells
                     else:
@@ -612,9 +637,7 @@ class MdxRenderer:
         return text.replace("|", "\\|")
 
     def pre_block(self, el: El) -> str:
-        code_el = next(
-            (c for c in el.children if isinstance(c, El) and c.tag == "code"), None
-        )
+        code_el = next((c for c in el.children if isinstance(c, El) and c.tag == "code"), None)
         source = code_el if code_el is not None else el
         class_name = source.props.get("className")
         lang = ""
@@ -625,9 +648,7 @@ class MdxRenderer:
         return fence(plain_text(source.children).strip("\n"), lang)
 
     def details_block(self, el: El) -> list[str]:
-        summary = next(
-            (c for c in el.children if isinstance(c, El) and c.tag == "summary"), None
-        )
+        summary = next((c for c in el.children if isinstance(c, El) and c.tag == "summary"), None)
         out = []
         if summary is not None:
             label = collapse_ws(self.inline(summary.children))
@@ -662,11 +683,7 @@ class MdxRenderer:
             lines = []
             for line in code.get("lines") or []:
                 tokens = line.get("tokens") or [] if isinstance(line, dict) else []
-                lines.append(
-                    "".join(
-                        str(t.get("content", "")) for t in tokens if isinstance(t, dict)
-                    )
-                )
+                lines.append("".join(str(t.get("content", "")) for t in tokens if isinstance(t, dict)))
             text = "\n".join(lines).strip("\n")
             if not text.strip():
                 continue
@@ -726,6 +743,7 @@ class MdxRenderer:
 # Link resolution
 # ---------------------------------------------------------------------------
 
+
 def relative_link(target: str, from_dir: str) -> str:
     rel = os.path.relpath(target, from_dir) if from_dir else target
     return rel if rel.startswith(".") else "./" + rel
@@ -784,11 +802,12 @@ def clean_spec_text(text: str | None, resolve, inline: bool = False) -> str:
 # OpenAPI to markdown
 # ---------------------------------------------------------------------------
 
+
 def resolve_ref(ref: str, spec: dict):
     """Resolve a local $ref pointer such as '#/components/schemas/AlbumObject'."""
     if not ref.startswith("#/"):
         return {}
-    node = spec
+    node: object = spec
     for part in ref[2:].split("/"):
         part = part.replace("~1", "/").replace("~0", "~")
         if isinstance(node, list):
@@ -802,7 +821,7 @@ def resolve_ref(ref: str, spec: dict):
             return {}
         if node is None:
             return {}
-    return node
+    return node if isinstance(node, dict) else {}
 
 
 def deref(node, spec: dict):
@@ -967,9 +986,7 @@ def format_parameters(parameters: list, spec: dict, resolve) -> list[str]:
         return []
     return [
         "### Parameters",
-        "\n".join(
-            ["| Name | In | Type | Required | Description |", "|---|---|---|---|---|"] + rows
-        ),
+        "\n".join(["| Name | In | Type | Required | Description |", "|---|---|---|---|---|"] + rows),
     ]
 
 
@@ -1143,9 +1160,7 @@ def build_tag_readme(tag: str, endpoints: list[dict], tag_description: str) -> s
     lines.append("")
     for ep in endpoints:
         suffix = " (deprecated)" if ep["operation"].get("deprecated") else ""
-        lines.append(
-            f"- [{ep['title']}](./{ep['filename']}) - `{ep['method'].upper()} {ep['path']}`{suffix}"
-        )
+        lines.append(f"- [{ep['title']}](./{ep['filename']}) - `{ep['method'].upper()} {ep['path']}`{suffix}")
     lines.append("")
     return "\n".join(lines)
 
@@ -1166,8 +1181,7 @@ def build_reference_readme(groups: dict, info: dict, base_url: str, deprecated: 
         "",
         f"**Spec:** {SPEC_URL}",
         "",
-        f"{plural(total, 'endpoint')} in {plural(len(groups), 'group')}, "
-        f"{deprecated} of them deprecated.",
+        f"{plural(total, 'endpoint')} in {plural(len(groups), 'group')}, {deprecated} of them deprecated.",
         "",
         "## Groups",
         "",
@@ -1205,7 +1219,7 @@ def is_reference_path(path: str) -> bool:
 
 
 def guide_output(path: str) -> str:
-    rel = path[len(ENTRY_PATH):].strip("/")
+    rel = path[len(ENTRY_PATH) :].strip("/")
     return f"{rel}.md" if rel else "index.md"
 
 
@@ -1214,7 +1228,7 @@ def guide_section(output: str) -> str:
 
 
 def page_data_url(build_id: str, path: str) -> str:
-    segments = path[len("/documentation/"):].split("/")
+    segments = path[len("/documentation/") :].split("/")
     query = "&".join("mdx=" + quote(s, safe="") for s in segments)
     return f"{SITE}/_next/data/{build_id}{path}.json?{query}"
 
@@ -1247,8 +1261,15 @@ def build_guide_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_top_readme(guides: list[dict], groups: dict, info: dict, base_url: str,
-                     scopes: dict, deprecated: int, total_endpoints: int) -> str:
+def build_top_readme(
+    guides: list[dict],
+    groups: dict,
+    info: dict,
+    base_url: str,
+    scopes: dict,
+    deprecated: int,
+    total_endpoints: int,
+) -> str:
     lines = [
         "# Spotify Web API Documentation",
         "",
@@ -1273,9 +1294,7 @@ def build_top_readme(guides: list[dict], groups: dict, info: dict, base_url: str
     for guide in guides:
         by_section.setdefault(guide["section"], []).append(guide)
 
-    ordered_sections = list(SECTION_TITLES) + sorted(
-        s for s in by_section if s not in SECTION_TITLES
-    )
+    ordered_sections = list(SECTION_TITLES) + sorted(s for s in by_section if s not in SECTION_TITLES)
     for section in ordered_sections:
         pages = by_section.get(section)
         if not pages:
@@ -1306,6 +1325,7 @@ def build_top_readme(guides: list[dict], groups: dict, info: dict, base_url: str
 # Sync
 # ---------------------------------------------------------------------------
 
+
 class Writer:
     """Applies cache decisions and writes output files deterministically."""
 
@@ -1325,11 +1345,7 @@ class Writer:
         if extra:
             entry.update(extra)
 
-        if (
-            not self.args.force
-            and cached.get("sha256") == content_hash
-            and os.path.exists(target)
-        ):
+        if not self.args.force and cached.get("sha256") == content_hash and os.path.exists(target):
             self.unchanged += 1
             self.new_cache[key] = entry
             return
@@ -1376,16 +1392,18 @@ def collect_endpoints(spec: dict) -> tuple[dict, dict, int]:
             slug = sanitize_filename(operation_id) or sanitize_filename(f"{method}-{path}")
             for tag in operation.get("tags") or ["Other"]:
                 tag_dir = sanitize_filename(tag)
-                endpoints_by_tag.setdefault(tag, []).append({
-                    "path": path,
-                    "method": method,
-                    "operation": operation,
-                    "operation_id": operation_id,
-                    "title": op_title(operation, method, path),
-                    "filename": f"{slug}.md",
-                    "dir": f"{REFERENCE_DIR}/{tag_dir}",
-                    "key": f"{REFERENCE_DIR}/{tag_dir}/{slug}.md",
-                })
+                endpoints_by_tag.setdefault(tag, []).append(
+                    {
+                        "path": path,
+                        "method": method,
+                        "operation": operation,
+                        "operation_id": operation_id,
+                        "title": op_title(operation, method, path),
+                        "filename": f"{slug}.md",
+                        "dir": f"{REFERENCE_DIR}/{tag_dir}",
+                        "key": f"{REFERENCE_DIR}/{tag_dir}/{slug}.md",
+                    }
+                )
 
     for endpoints in endpoints_by_tag.values():
         endpoints.sort(key=lambda e: (e["path"], HTTP_METHODS.index(e["method"])))
@@ -1447,9 +1465,7 @@ def sync(args: argparse.Namespace) -> int:
                 key = guide_output(path)
                 cached = lookup.get(key, {})
                 etag = cached.get("etag") if cached.get("fetcher_sha") == FETCHER_SHA else None
-                futures.append(
-                    pool.submit(fetch_page, path, build_id, etag, os.path.join(DOCS_DIR, key))
-                )
+                futures.append(pool.submit(fetch_page, path, build_id, etag, os.path.join(DOCS_DIR, key)))
             results = [f.result() for f in futures]
 
         for path, url, status, body, headers in sorted(results):
@@ -1463,9 +1479,7 @@ def sync(args: argparse.Namespace) -> int:
                     pages[path] = record
                     continue
                 record["props"] = props
-                for href in COMPILED_LINK_RE.findall(
-                    (props.get("source") or {}).get("compiledSource") or ""
-                ):
+                for href in COMPILED_LINK_RE.findall((props.get("source") or {}).get("compiledSource") or ""):
                     found = normalize_path(href)
                     if found not in seen and not is_reference_path(found):
                         order.setdefault(found, len(order))
@@ -1513,7 +1527,10 @@ def sync(args: argparse.Namespace) -> int:
     endpoints_by_tag: dict[str, list[dict]] = {}
     if spec:
         endpoints_by_tag, groups, total_endpoints = collect_endpoints(spec)
-        info = {"version": (spec.get("info") or {}).get("version", "?"), "openapi": spec.get("openapi", "3.0")}
+        info = {
+            "version": (spec.get("info") or {}).get("version", "?"),
+            "openapi": spec.get("openapi", "3.0"),
+        }
         base_url = resolve_server_url(spec)
         scopes = (
             ((spec.get("components") or {}).get("securitySchemes") or {})
@@ -1522,15 +1539,19 @@ def sync(args: argparse.Namespace) -> int:
             .get("authorizationCode", {})
             .get("scopes", {})
         )
-        deprecated_count = len({
-            e["operation_id"] for eps in endpoints_by_tag.values() for e in eps
-            if e["operation"].get("deprecated")
-        })
+        deprecated_count = len(
+            {
+                e["operation_id"]
+                for eps in endpoints_by_tag.values()
+                for e in eps
+                if e["operation"].get("deprecated")
+            }
+        )
     else:
         groups = spec_cached.get("groups") or {}
         info = spec_cached.get("info") or {}
         base_url = spec_cached.get("base_url", "")
-        scopes = {name: "" for name in spec_cached.get("scopes") or []}
+        scopes = dict.fromkeys(spec_cached.get("scopes") or [], "")
         total_endpoints = spec_cached.get("endpoint_count", 0)
         deprecated_count = spec_cached.get("deprecated_count", 0)
 
@@ -1613,9 +1634,7 @@ def sync(args: argparse.Namespace) -> int:
             props = record.get("props") or {}
             source = props.get("source") or {}
             frontmatter = source.get("frontmatter") or {}
-            title = collapse_ws(
-                str(frontmatter.get("title") or props.get("pageTitle") or key[:-3])
-            )
+            title = collapse_ws(str(frontmatter.get("title") or props.get("pageTitle") or key[:-3]))
             description = str(frontmatter.get("description") or "")
             try:
                 root = parse_compiled_mdx(source.get("compiledSource") or "")
@@ -1627,19 +1646,25 @@ def sync(args: argparse.Namespace) -> int:
                 conversion_failures.append(path)
                 if cached:
                     writer.keep(key, cached)
-                    guide_index.append({
-                        "output": key,
-                        "title": cached.get("title") or key[:-3],
-                        "section": cached.get("section", guide_section(key)),
-                    })
+                    guide_index.append(
+                        {
+                            "output": key,
+                            "title": cached.get("title") or key[:-3],
+                            "section": cached.get("section", guide_section(key)),
+                        }
+                    )
                 continue
-            writer.write(key, content, extra={
-                "url": record["url"],
-                "etag": record.get("etag"),
-                "fetcher_sha": FETCHER_SHA,
-                "title": title,
-                "section": guide_section(key),
-            })
+            writer.write(
+                key,
+                content,
+                extra={
+                    "url": record["url"],
+                    "etag": record.get("etag"),
+                    "fetcher_sha": FETCHER_SHA,
+                    "title": title,
+                    "section": guide_section(key),
+                },
+            )
             guide_index.append({"output": key, "title": title, "section": guide_section(key)})
             continue
 
@@ -1650,18 +1675,18 @@ def sync(args: argparse.Namespace) -> int:
         if record["status"] == 304 and record.get("etag"):
             entry["etag"] = record["etag"]
         writer.keep(key, entry)
-        guide_index.append({
-            "output": key,
-            "title": entry.get("title") or key[:-3],
-            "section": entry.get("section", guide_section(key)),
-        })
+        guide_index.append(
+            {
+                "output": key,
+                "title": entry.get("title") or key[:-3],
+                "section": entry.get("section", guide_section(key)),
+            }
+        )
 
     # -- top-level catalogue --------------------------------------------
     writer.write(
         "README.md",
-        build_top_readme(
-            guide_index, groups, info, base_url, scopes, deprecated_count, total_endpoints
-        ),
+        build_top_readme(guide_index, groups, info, base_url, scopes, deprecated_count, total_endpoints),
     )
 
     # -- source snapshot -------------------------------------------------
@@ -1709,11 +1734,11 @@ def sync(args: argparse.Namespace) -> int:
             removed += 1
 
         if not args.dry_run:
-            for root, dirs, files in os.walk(DOCS_DIR, topdown=False):
-                if root != DOCS_DIR and not dirs and not files:
-                    os.rmdir(root)
+            for dirpath, dirs, files in os.walk(DOCS_DIR, topdown=False):
+                if dirpath != DOCS_DIR and not dirs and not files:
+                    os.rmdir(dirpath)
                     if args.verbose:
-                        print(f"  RMDIR {os.path.relpath(root, DOCS_DIR)}/")
+                        print(f"  RMDIR {os.path.relpath(dirpath, DOCS_DIR)}/")
 
     if not args.dry_run:
         save_cache(writer.new_cache)

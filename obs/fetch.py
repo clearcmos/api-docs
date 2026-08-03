@@ -35,7 +35,8 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -57,13 +58,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -79,8 +83,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -105,6 +109,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # ---------------------------------------------------------------------------
 # Page discovery (searchindex.js)
 # ---------------------------------------------------------------------------
+
 
 def discover_docnames() -> list[str]:
     """Return the authoritative page list from Sphinx's searchindex.js."""
@@ -200,6 +205,7 @@ def heading_text(lines: list[str], i: int) -> str | None:
 # Pass 1: collect titles + label anchors across the whole corpus
 # ---------------------------------------------------------------------------
 
+
 def collect_metadata(sources: dict[str, str]) -> tuple[dict[str, str], dict[str, dict]]:
     """Return (doc_titles, label_map).
 
@@ -211,7 +217,7 @@ def collect_metadata(sources: dict[str, str]) -> tuple[dict[str, str], dict[str,
     label_map: dict[str, dict] = {}
 
     for docname, text in sources.items():
-        lines = [expand(l) for l in text.split("\n")]
+        lines = [expand(line) for line in text.split("\n")]
         pending: list[str] = []
         title = None
         i = 0
@@ -288,10 +294,9 @@ CODE_LANG = {"cpp": "cpp", "c": "c", "lua": "lua", "python": "python", "text": "
 
 
 class RstConverter:
-    def __init__(self, docname: str, text: str, doc_titles: dict[str, str],
-                 label_map: dict[str, dict]):
+    def __init__(self, docname: str, text: str, doc_titles: dict[str, str], label_map: dict[str, dict]):
         self.docname = docname
-        self.lines = [expand(l) for l in text.split("\n")]
+        self.lines = [expand(line) for line in text.split("\n")]
         self.doc_titles = doc_titles
         self.label_map = label_map
         self.level_for_char: dict[str, int] = {}
@@ -372,11 +377,12 @@ class RstConverter:
 
         # 4. Bare named references: name_
         if self.named_links:
+
             def repl_named(m: re.Match) -> str:
                 name = m.group(1)
                 if name in self.named_links:
                     return stash(f"[{name}]({self.named_links[name]})")
-                return m.group(0)
+                return cast(str, m.group(0))
 
             text = re.sub(r"\b([A-Za-z][\w.:+-]*)_\b(?!`)", repl_named, text)
 
@@ -420,9 +426,8 @@ class RstConverter:
         if display.startswith("~"):
             display = display[1:].split(".")[-1]
         display = display.lstrip("~")
-        if role in ("func", "function", "meth", "method"):
-            if not display.endswith(")"):
-                display = f"{display}()"
+        if role in ("func", "function", "meth", "method") and not display.endswith(")"):
+            display = f"{display}()"
         return f"`{display}`"
 
     # -- block processing ----------------------------------------------------
@@ -460,10 +465,7 @@ class RstConverter:
         # trim trailing blanks
         while raw and not raw[-1].strip():
             raw.pop()
-        if min_indent:
-            body = [l[min_indent:] if l.strip() else "" for l in raw]
-        else:
-            body = raw
+        body = [line[min_indent:] if line.strip() else "" for line in raw] if min_indent else raw
         return body, i
 
     def render_subblock(self, lines: list[str], prefix: str = "") -> None:
@@ -659,8 +661,7 @@ class RstConverter:
                 i += 1
             body = " ".join(x for x in ([value] + cont) if x).strip()
             label = self._field_label(role, arg)
-            items.append(f"- **{label}**: {self.inline(body)}" if body
-                         else f"- **{label}**")
+            items.append(f"- **{label}**: {self.inline(body)}" if body else f"- **{label}**")
         if items:
             self.emit("")
             for it in items:
@@ -760,7 +761,7 @@ class RstConverter:
             note = f"{verb} {arg}." if arg else f"{verb}."
             if name == "deprecated":
                 self.emit("")
-                self.emit(f"> [!WARNING]")
+                self.emit("> [!WARNING]")
                 self.emit(f"> **{note}**")
                 if any(x.strip() for x in body):
                     self.render_subblock(body, prefix="> ")
@@ -804,8 +805,7 @@ class RstConverter:
         return nxt
 
 
-def convert_page(docname: str, text: str, doc_titles: dict[str, str],
-                 label_map: dict[str, dict]) -> str:
+def convert_page(docname: str, text: str, doc_titles: dict[str, str], label_map: dict[str, dict]) -> str:
     return RstConverter(docname, text, doc_titles, label_map).run()
 
 
@@ -818,13 +818,14 @@ def build_page_markdown(docname: str, body: str) -> str:
 # toctree parsing (for the README tree)
 # ---------------------------------------------------------------------------
 
+
 def parse_toctrees(text: str) -> list[dict]:
     """Parse every `.. toctree::` in a page.
 
     Returns a list of {"caption": str|None, "entries": [(title, target)]} where
     target is a docname (internal) or a URL (external, when it contains '://').
     """
-    lines = [expand(l) for l in text.split("\n")]
+    lines = [expand(line) for line in text.split("\n")]
     trees: list[dict] = []
     i = 0
     n = len(lines)
@@ -861,17 +862,13 @@ def parse_toctrees(text: str) -> list[dict]:
     return trees
 
 
-def build_readme(docnames: list[str], sources: dict[str, str],
-                 doc_titles: dict[str, str]) -> str:
+def build_readme(docnames: list[str], sources: dict[str, str], doc_titles: dict[str, str]) -> str:
     # child docname -> parsed toctrees of that page
-    tree_of: dict[str, list[dict]] = {
-        dn: parse_toctrees(sources[dn]) for dn in docnames if dn in sources
-    }
+    tree_of: dict[str, list[dict]] = {dn: parse_toctrees(sources[dn]) for dn in docnames if dn in sources}
 
     lines = ["# OBS Studio Documentation", ""]
     project = "OBS Studio"
-    lines.append(f"API and developer documentation for {project}, mirrored from "
-                 f"[{SITE}]({SITE}).")
+    lines.append(f"API and developer documentation for {project}, mirrored from [{SITE}]({SITE}).")
     lines.append("")
 
     reachable: set[str] = set()
@@ -919,6 +916,7 @@ def build_readme(docnames: list[str], sources: dict[str, str],
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
 
@@ -962,6 +960,10 @@ def sync(args: argparse.Namespace) -> None:
     for dn in docnames:
         text = sources.get(dn)
         if text is None:
+            previous = cache.get(dn)
+            previous_path = os.path.join(DOCS_DIR, f"{dn}.md")
+            if previous and os.path.exists(previous_path):
+                new_cache[dn] = previous
             continue
         body = convert_page(dn, text, doc_titles, label_map)
         content = build_page_markdown(dn, body)
@@ -974,11 +976,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[dn] = prev
             continue
         is_new = dn not in cache or not os.path.exists(file_path)
-        write_file(file_path, content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            file_path,
+            content,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[dn] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -996,11 +1003,16 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[readme_key] = prev
     else:
         is_new = readme_key not in cache or not os.path.exists(readme_path)
-        write_file(readme_path, readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            readme_path,
+            readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[readme_key] = {
             "sha256": readme_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -1012,10 +1024,7 @@ def sync(args: argparse.Namespace) -> None:
     for old_key in sorted(cache):
         if old_key in new_cache:
             continue
-        if old_key == "__readme__":
-            old_path = readme_path
-        else:
-            old_path = os.path.join(DOCS_DIR, f"{old_key}.md")
+        old_path = readme_path if old_key == "__readme__" else os.path.join(DOCS_DIR, f"{old_key}.md")
         if not os.path.exists(old_path):
             continue
         if args.dry_run:
@@ -1042,12 +1051,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch OBS Studio documentation and mirror to local markdown"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

@@ -26,7 +26,8 @@ import posixpath
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -71,7 +72,7 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -87,8 +88,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -114,6 +115,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # Discovery
 # ---------------------------------------------------------------------------
 
+
 def discover_pages() -> tuple[dict[str, str], str]:
     """Return page paths and a hash of their Git blobs plus mkdocs.yml."""
     print("Fetching repository tree...")
@@ -123,40 +125,41 @@ def discover_pages() -> tuple[dict[str, str], str]:
         sys.exit(1)
     data = json.loads(body)
     if data.get("truncated"):
-        print("WARNING: tree response truncated; some files may be missing",
-              file=sys.stderr)
+        print("WARNING: tree response truncated; some files may be missing", file=sys.stderr)
     pages: dict[str, str] = {}
     blob_shas: dict[str, str] = {}
     for t in data.get("tree", []):
         path = t.get("path", "")
         if t.get("type") == "blob":
             blob_shas[path] = t.get("sha", "")
-        if (t.get("type") == "blob"
-                and path.startswith(DOCS_PREFIX)
-                and path.endswith(".md")):
-            pages[path[len(DOCS_PREFIX):]] = path
+        if t.get("type") == "blob" and path.startswith(DOCS_PREFIX) and path.endswith(".md"):
+            pages[path[len(DOCS_PREFIX) :]] = path
     for rel, repo_path in ROOT_PAGES.items():
         pages[rel] = repo_path
     relevant = set(pages.values()) | {"www/mkdocs.yml"}
     with open(__file__, "rb") as f:
         fetcher_hash = hashlib.sha256(f.read()).hexdigest()
-    fingerprint = sha256(json.dumps({
-        "blobs": sorted((path, blob_shas.get(path, ""))
-                        for path in relevant),
-        "fetcher": fetcher_hash,
-    }, separators=(",", ":")))
+    fingerprint = sha256(
+        json.dumps(
+            {
+                "blobs": sorted((path, blob_shas.get(path, "")) for path in relevant),
+                "fetcher": fetcher_hash,
+            },
+            separators=(",", ":"),
+        )
+    )
     return pages, fingerprint
 
 
 def source_outputs_complete(source: dict) -> bool:
     outputs = source.get("outputs", [])
-    return bool(outputs) and all(
-        os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
+    return bool(outputs) and all(os.path.isfile(os.path.join(DOCS_DIR, rel)) for rel in outputs)
 
 
 # ---------------------------------------------------------------------------
 # mkdocs.yml nav parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_nav(yml_text: str) -> list[dict]:
     """Parse the `nav:` block of mkdocs.yml into a nested entry list.
@@ -177,7 +180,7 @@ def parse_nav(yml_text: str) -> list[dict]:
 
     items: list[dict] = []
     stack: list[tuple[int, list[dict]]] = [(-1, items)]
-    for line in lines[start + 1:]:
+    for line in lines[start + 1 :]:
         if not line.strip():
             continue
         if not line.startswith(" "):  # left the nav block
@@ -191,9 +194,10 @@ def parse_nav(yml_text: str) -> list[dict]:
             stack.pop()
         parent = stack[-1][1]
         if rest.endswith(":"):
-            node = {"title": rest[:-1].strip(), "children": []}
+            children: list[dict] = []
+            node: dict = {"title": rest[:-1].strip(), "children": children}
             parent.append(node)
-            stack.append((indent, node["children"]))
+            stack.append((indent, children))
         elif ":" in rest:
             title, _, path = rest.partition(":")
             parent.append({"title": title.strip(), "page": path.strip()})
@@ -245,7 +249,7 @@ def convert_tabs(text: str) -> str:
                 i += 1
                 continue
             if line.startswith(prefix):
-                out.append(indent + line[len(prefix):])
+                out.append(indent + line[len(prefix) :])
                 i += 1
             else:
                 break
@@ -253,12 +257,10 @@ def convert_tabs(text: str) -> str:
 
 
 LINK_RE = re.compile(r"(!?)\[([^\]]*)\]\(([^)\s]+)\)")
-ASSET_EXT_RE = re.compile(
-    r"\.(png|jpe?g|gif|webp|svg|ico|pdf|ya?ml|json|txt|sh|ps1)$", re.I)
+ASSET_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg|ico|pdf|ya?ml|json|txt|sh|ps1)$", re.I)
 
 
-def rewrite_links(text: str, site_dir: str, repo_dir: str,
-                  page_set: set[str]) -> str:
+def rewrite_links(text: str, site_dir: str, repo_dir: str, page_set: set[str]) -> str:
     """Fix link targets that do not resolve in the mirrored docs tree.
 
     The on-disk layout matches the source layout, so links between fetched
@@ -269,17 +271,16 @@ def rewrite_links(text: str, site_dir: str, repo_dir: str,
     def repl(m: re.Match) -> str:
         bang, label, target = m.groups()
         if target.startswith(("http://", "https://", "mailto:", "#")):
-            return m.group(0)
+            return str(m.group(0))
         path, _, frag = target.partition("#")
         frag = f"#{frag}" if frag else ""
         resolved = posixpath.normpath(posixpath.join(site_dir, path))
         if resolved in page_set:
-            return m.group(0)
+            return str(m.group(0))
         if resolved.startswith("static/") or (bang and ASSET_EXT_RE.search(path)):
             return f"{bang}[{label}]({SITE_BASE}/{resolved})"
         repo_resolved = posixpath.normpath(posixpath.join(repo_dir, path))
-        return (f"{bang}[{label}]"
-                f"(https://github.com/{REPO}/blob/{BRANCH}/{repo_resolved}{frag})")
+        return f"{bang}[{label}](https://github.com/{REPO}/blob/{BRANCH}/{repo_resolved}{frag})"
 
     fence = False
     out: list[str] = []
@@ -310,7 +311,7 @@ def build_page(raw: str, rel: str, repo_path: str, nav_title: str | None) -> tup
     # rendering of their contents; the inner markdown stands on its own.
     body = DIV_LINE_RE.sub("", raw)
     body = convert_tabs(body)
-    body = rewrite_links(body, site_dir, repo_dir, build_page.page_set)
+    body = rewrite_links(body, site_dir, repo_dir, PAGE_SET)
 
     title = nav_title or title_from(body, fallback=rel)
     source_url = f"{SITE_BASE}/{rel[:-3]}.html"
@@ -320,7 +321,7 @@ def build_page(raw: str, rel: str, repo_path: str, nav_title: str | None) -> tup
     m = re.match(r"^(#\s+.+)\n+", body)
     if m:
         parts.append(m.group(1).strip())
-        body = body[m.end():]
+        body = body[m.end() :]
     else:
         parts.append(f"# {title}")
     parts.append("")
@@ -331,15 +332,17 @@ def build_page(raw: str, rel: str, repo_path: str, nav_title: str | None) -> tup
     return "\n".join(parts) + body.strip("\n") + "\n", title
 
 
-build_page.page_set = set()
+PAGE_SET: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
 # Index generation
 # ---------------------------------------------------------------------------
 
-def render_nav_list(entries: list[dict], titles: dict[str, str],
-                    page_set: set[str], depth: int = 0) -> list[str]:
+
+def render_nav_list(
+    entries: list[dict], titles: dict[str, str], page_set: set[str], depth: int = 0
+) -> list[str]:
     lines: list[str] = []
     pad = "  " * depth
     for e in entries:
@@ -355,8 +358,7 @@ def render_nav_list(entries: list[dict], titles: dict[str, str],
     return lines
 
 
-def build_top_readme(nav: list[dict], titles: dict[str, str],
-                     page_set: set[str]) -> str:
+def build_top_readme(nav: list[dict], titles: dict[str, str], page_set: set[str]) -> str:
     lines = ["# File Browser Documentation", ""]
     lines.append(f"*Mirrored from [{SITE_BASE}/]({SITE_BASE}/).*")
     lines.append(f"*Source repo: [github.com/{REPO}](https://github.com/{REPO}).*")
@@ -375,15 +377,14 @@ def build_top_readme(nav: list[dict], titles: dict[str, str],
     return "\n".join(lines)
 
 
-def build_cli_readme(nav_order: list[str], titles: dict[str, str],
-                     page_set: set[str]) -> str:
+def build_cli_readme(nav_order: list[str], titles: dict[str, str], page_set: set[str]) -> str:
     cli = [p for p in nav_order if p.startswith("cli/") and p in page_set]
     cli += sorted(p for p in page_set if p.startswith("cli/") and p not in cli)
     lines = ["# Command Line Usage", ""]
     lines.append(f"{len(cli)} pages documenting the `filebrowser` CLI.")
     lines.append("")
     for rel in cli:
-        name = rel[len("cli/"):]
+        name = rel[len("cli/") :]
         lines.append(f"- [{titles.get(rel, rel)}](./{name})")
     lines.append("")
     return "\n".join(lines)
@@ -393,6 +394,7 @@ def build_cli_readme(nav_order: list[str], titles: dict[str, str],
 # Sync
 # ---------------------------------------------------------------------------
 
+
 def sync(args: argparse.Namespace) -> None:
     # The previous cache is always loaded for removal detection; --force
     # only disables the unchanged-skip.
@@ -400,16 +402,19 @@ def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else old_cache
 
     pages, source_fingerprint = discover_pages()
-    print(f"  found {len(pages)} pages ({len(pages) - len(ROOT_PAGES)} in "
-          f"{DOCS_PREFIX}, {len(ROOT_PAGES)} repo-root)")
+    print(
+        f"  found {len(pages)} pages ({len(pages) - len(ROOT_PAGES)} in "
+        f"{DOCS_PREFIX}, {len(ROOT_PAGES)} repo-root)"
+    )
 
     previous_source = cache.get(SOURCE_CACHE_KEY, {})
-    if (not args.force
-            and previous_source.get("fingerprint") == source_fingerprint
-            and source_outputs_complete(previous_source)):
+    if (
+        not args.force
+        and previous_source.get("fingerprint") == source_fingerprint
+        and source_outputs_complete(previous_source)
+    ):
         total_files = len(previous_source["outputs"])
-        print("  Source tree unchanged and all outputs present; "
-              "skipping content downloads and conversion")
+        print("  Source tree unchanged and all outputs present; skipping content downloads and conversion")
         print("\nSync complete:")
         print("  Added:       0")
         print("  Updated:     0")
@@ -422,13 +427,11 @@ def sync(args: argparse.Namespace) -> None:
     print("Fetching mkdocs.yml...")
     mkdocs_yml = fetch_url(MKDOCS_URL)
     if mkdocs_yml is None:
-        print("ERROR: failed to fetch mkdocs.yml; leaving the existing "
-              "mirror untouched", file=sys.stderr)
+        print("ERROR: failed to fetch mkdocs.yml; leaving the existing mirror untouched", file=sys.stderr)
         sys.exit(1)
     nav = parse_nav(mkdocs_yml) if mkdocs_yml else []
     if not nav:
-        print("WARNING: could not parse mkdocs nav; indexes will be flat",
-              file=sys.stderr)
+        print("WARNING: could not parse mkdocs nav; indexes will be flat", file=sys.stderr)
 
     nav_titles: dict[str, str] = {}
 
@@ -463,12 +466,15 @@ def sync(args: argparse.Namespace) -> None:
         print(f"  unavailable: {len(missing)}")
         for rel in sorted(missing):
             print(f"    SKIP {rel}")
-        print("ERROR: source tree entries could not be fetched; leaving the "
-              "existing mirror untouched", file=sys.stderr)
+        print(
+            "ERROR: source tree entries could not be fetched; leaving the existing mirror untouched",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
+    global PAGE_SET
     page_set = set(fetched)
-    build_page.page_set = page_set
+    PAGE_SET = page_set
 
     if not args.dry_run:
         os.makedirs(DOCS_DIR, exist_ok=True)
@@ -488,11 +494,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             return
         is_new = cache_key not in cache or not os.path.exists(file_path)
-        write_file(file_path, content, dry_run=args.dry_run,
-                   verbose=args.verbose, label="ADD" if is_new else "UPDATE")
+        write_file(
+            file_path,
+            content,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -500,21 +511,22 @@ def sync(args: argparse.Namespace) -> None:
             updated += 1
 
     for rel in sorted(fetched):
-        page_md, title = build_page(fetched[rel], rel, pages[rel],
-                                    nav_titles.get(rel))
+        page_md, title = build_page(fetched[rel], rel, pages[rel], nav_titles.get(rel))
         titles[rel] = title
         emit(rel, os.path.join(DOCS_DIR, *rel.split("/")), page_md)
 
-    emit("__readme__/_top", os.path.join(DOCS_DIR, "README.md"),
-         build_top_readme(nav, titles, page_set))
-    emit("__readme__/cli", os.path.join(DOCS_DIR, "cli", "README.md"),
-         build_cli_readme(nav_pages(nav), titles, page_set))
+    emit("__readme__/_top", os.path.join(DOCS_DIR, "README.md"), build_top_readme(nav, titles, page_set))
+    emit(
+        "__readme__/cli",
+        os.path.join(DOCS_DIR, "cli", "README.md"),
+        build_cli_readme(nav_pages(nav), titles, page_set),
+    )
 
     new_cache[SOURCE_CACHE_KEY] = {
         "fingerprint": source_fingerprint,
         "outputs": sorted(output_paths),
         "page_count": len(fetched),
-        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "last_updated": datetime.now(UTC).isoformat(),
     }
 
     # Removals
@@ -527,7 +539,7 @@ def sync(args: argparse.Namespace) -> None:
         if old_key == "__readme__/_top":
             old_path = os.path.join(DOCS_DIR, "README.md")
         elif old_key.startswith("__readme__/"):
-            old_path = os.path.join(DOCS_DIR, old_key[len("__readme__/"):], "README.md")
+            old_path = os.path.join(DOCS_DIR, old_key[len("__readme__/") :], "README.md")
         else:
             old_path = os.path.join(DOCS_DIR, *old_key.split("/"))
         if not os.path.exists(old_path):
@@ -561,12 +573,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch File Browser docs from GitHub and mirror to local markdown"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

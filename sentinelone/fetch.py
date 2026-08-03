@@ -29,7 +29,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -42,6 +42,7 @@ SPEC_FILE = os.path.join(SCRIPT_DIR, "api-spec.json")
 # ---------------------------------------------------------------------------
 # Standard helpers
 # ---------------------------------------------------------------------------
+
 
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -59,7 +60,7 @@ def fetch_url(url: str, cookie_header: str | None = None, timeout: int = 60) -> 
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -76,8 +77,9 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -102,12 +104,13 @@ def clean_desc(desc: str) -> str:
 # Auth helpers
 # ---------------------------------------------------------------------------
 
+
 def build_cookie_header(args: argparse.Namespace) -> str:
     """Return a Cookie header string from --cookie or --cookie-file."""
     if args.cookie:
-        return args.cookie.strip()
+        return str(args.cookie).strip()
     if args.cookie_file:
-        with open(args.cookie_file, "r") as f:
+        with open(str(args.cookie_file)) as f:
             return f.read().strip()
     # Should not get here -- argparse validation catches it.
     print("ERROR: One of --cookie or --cookie-file is required.", file=sys.stderr)
@@ -133,6 +136,7 @@ def verify_auth(base_url: str, cookie_header: str) -> None:
 # ---------------------------------------------------------------------------
 # Spec discovery
 # ---------------------------------------------------------------------------
+
 
 def discover_api_spec(base_url: str, cookie_header: str) -> tuple[dict | None, str | None]:
     """Try to find and fetch the S1 API spec."""
@@ -177,6 +181,7 @@ def discover_api_spec(base_url: str, cookie_header: str) -> tuple[dict | None, s
 # ---------------------------------------------------------------------------
 # S1 custom-format endpoint -> markdown
 # ---------------------------------------------------------------------------
+
 
 def s1_endpoint_to_markdown(category_name: str, op_key: str, endpoint: dict) -> str:
     """Convert an S1 custom-format endpoint to markdown."""
@@ -281,11 +286,7 @@ def s1_endpoint_to_markdown(category_name: str, op_key: str, endpoint: dict) -> 
         if isinstance(responses, dict):
             resp_items = sorted(responses.items(), key=lambda x: str(x[0]))
         elif isinstance(responses, list):
-            resp_items = [
-                (r.get("code", r.get("status", "?")), r)
-                for r in responses
-                if isinstance(r, dict)
-            ]
+            resp_items = [(r.get("code", r.get("status", "?")), r) for r in responses if isinstance(r, dict)]
         else:
             resp_items = []
         for status, resp_info in resp_items:
@@ -315,6 +316,7 @@ def s1_endpoint_to_markdown(category_name: str, op_key: str, endpoint: dict) -> 
 # ---------------------------------------------------------------------------
 # OpenAPI fallback endpoint -> markdown
 # ---------------------------------------------------------------------------
+
 
 def openapi_endpoint_to_markdown(endpoint: dict) -> str:
     """Convert a standard OpenAPI endpoint to markdown."""
@@ -372,6 +374,7 @@ def openapi_endpoint_to_markdown(endpoint: dict) -> str:
 # Markdown generation -- S1 custom format
 # ---------------------------------------------------------------------------
 
+
 def build_s1_category_readme(cat_name: str, endpoints: list[dict]) -> str:
     lines = [f"# {cat_name}\n", "Endpoints in this category:\n"]
     for ep in endpoints:
@@ -404,6 +407,7 @@ def build_s1_main_readme(base_url: str, categories: list[tuple[str, str, int]], 
 # Markdown generation -- OpenAPI fallback
 # ---------------------------------------------------------------------------
 
+
 def build_openapi_tag_readme(tag_name: str, endpoints: list[dict]) -> str:
     lines = [f"# {tag_name}\n", "Endpoints in this category:\n"]
     for ep in endpoints:
@@ -419,7 +423,9 @@ def build_openapi_tag_readme(tag_name: str, endpoints: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_openapi_main_readme(base_url: str, info: dict, tags: list[tuple[str, str, int]], total_endpoints: int) -> str:
+def build_openapi_main_readme(
+    base_url: str, info: dict, tags: list[tuple[str, str, int]], total_endpoints: int
+) -> str:
     lines = [
         "# SentinelOne API Documentation\n",
         f"**API Version:** {info.get('version', 'unknown')}",
@@ -436,6 +442,7 @@ def build_openapi_main_readme(base_url: str, info: dict, tags: list[tuple[str, s
 # ---------------------------------------------------------------------------
 # Sync -- S1 custom format
 # ---------------------------------------------------------------------------
+
 
 def sync_s1(spec: dict, base_url: str, args: argparse.Namespace) -> None:
     """Generate markdown from the S1 custom spec format."""
@@ -481,13 +488,15 @@ def sync_s1(spec: dict, base_url: str, args: argparse.Namespace) -> None:
 
             filename = f"{method.lower()}-{sanitize_filename(op_key)}.md"
 
-            ep_meta.append({
-                "method": method,
-                "url": url,
-                "name": op_name,
-                "filename": filename,
-                "deprecated": op.get("isDeprecated", False),
-            })
+            ep_meta.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "name": op_name,
+                    "filename": filename,
+                    "deprecated": op.get("isDeprecated", False),
+                }
+            )
 
             # Build endpoint markdown
             ep_content = s1_endpoint_to_markdown(cat_name, op_key, ep_data)
@@ -509,7 +518,7 @@ def sync_s1(spec: dict, base_url: str, args: argparse.Namespace) -> None:
                         print(f"  {'ADD' if is_new else 'UPDATE'} {cat_slug}/{filename}")
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -538,7 +547,7 @@ def sync_s1(spec: dict, base_url: str, args: argparse.Namespace) -> None:
                     print(f"  {'ADD' if is_new else 'UPDATE'} {cat_slug}/README.md")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -582,7 +591,7 @@ def sync_s1(spec: dict, base_url: str, args: argparse.Namespace) -> None:
     if not args.dry_run:
         save_cache(new_cache)
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {added}")
     print(f"  Updated:    {updated}")
     print(f"  Unchanged:  {unchanged}")
@@ -595,6 +604,7 @@ def sync_s1(spec: dict, base_url: str, args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Sync -- OpenAPI fallback
 # ---------------------------------------------------------------------------
+
 
 def sync_openapi(spec: dict, base_url: str, args: argparse.Namespace) -> None:
     """Generate markdown from a standard OpenAPI/Swagger spec (fallback path)."""
@@ -609,17 +619,19 @@ def sync_openapi(spec: dict, base_url: str, args: argparse.Namespace) -> None:
     for path, methods in sorted(paths.items()):
         for method, details in methods.items():
             if method.lower() in ("get", "post", "put", "patch", "delete"):
-                endpoints.append({
-                    "path": path,
-                    "method": method.upper(),
-                    "summary": details.get("summary", ""),
-                    "description": details.get("description", ""),
-                    "tags": details.get("tags", []),
-                    "parameters": details.get("parameters", []),
-                    "request_body": details.get("requestBody", {}),
-                    "responses": details.get("responses", {}),
-                    "deprecated": details.get("deprecated", False),
-                })
+                endpoints.append(
+                    {
+                        "path": path,
+                        "method": method.upper(),
+                        "summary": details.get("summary", ""),
+                        "description": details.get("description", ""),
+                        "tags": details.get("tags", []),
+                        "parameters": details.get("parameters", []),
+                        "request_body": details.get("requestBody", {}),
+                        "responses": details.get("responses", {}),
+                        "deprecated": details.get("deprecated", False),
+                    }
+                )
 
     # Group by tag
     by_tag: dict[str, dict] = {}
@@ -633,10 +645,12 @@ def sync_openapi(spec: dict, base_url: str, args: argparse.Namespace) -> None:
             path_slug = ep["path"].strip("/").replace("/", "-").replace("{", "").replace("}", "")
             filename = sanitize_filename(f"{ep['method'].lower()}-{path_slug}") + ".md"
 
-            by_tag[tag_slug]["endpoints"].append({
-                **ep,
-                "filename": filename,
-            })
+            by_tag[tag_slug]["endpoints"].append(
+                {
+                    **ep,
+                    "filename": filename,
+                }
+            )
 
     if not args.dry_run:
         os.makedirs(DOCS_DIR, exist_ok=True)
@@ -676,7 +690,7 @@ def sync_openapi(spec: dict, base_url: str, args: argparse.Namespace) -> None:
                         print(f"  {'ADD' if is_new else 'UPDATE'} {tag_slug}/{ep['filename']}")
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -705,7 +719,7 @@ def sync_openapi(spec: dict, base_url: str, args: argparse.Namespace) -> None:
                     print(f"  {'ADD' if is_new else 'UPDATE'} {tag_slug}/README.md")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -749,7 +763,7 @@ def sync_openapi(spec: dict, base_url: str, args: argparse.Namespace) -> None:
     if not args.dry_run:
         save_cache(new_cache)
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {added}")
     print(f"  Updated:    {updated}")
     print(f"  Unchanged:  {unchanged}")
@@ -762,6 +776,7 @@ def sync_openapi(spec: dict, base_url: str, args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def sync(args: argparse.Namespace) -> None:
     cookie_header = build_cookie_header(args)
@@ -797,8 +812,7 @@ def sync(args: argparse.Namespace) -> None:
         print("\nDetected standard OpenAPI/Swagger spec format.")
         sync_openapi(spec, base_url, args)
     else:
-        print("\nUnrecognized spec format. Raw JSON has been saved for manual review.",
-              file=sys.stderr)
+        print("\nUnrecognized spec format. Raw JSON has been saved for manual review.", file=sys.stderr)
         sys.exit(1)
 
 

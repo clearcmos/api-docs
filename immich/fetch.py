@@ -17,7 +17,8 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -56,16 +57,19 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "immich-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "immich-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
-            return data.decode("utf-8")
+            return cast(str, data.decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -79,8 +83,8 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict[str, Any], json.load(f))
     return {}
 
 
@@ -93,6 +97,7 @@ def save_cache(cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # OpenAPI helpers
 # ---------------------------------------------------------------------------
+
 
 def resolve_ref(ref: str, spec: dict) -> dict:
     if not ref.startswith("#/"):
@@ -188,7 +193,7 @@ def schema_to_markdown(schema: dict, spec: dict, depth: int = 0, seen: set | Non
             if len(enum) > 10:
                 enum_str += f", ... ({len(enum)} total)"
             result += f" -- enum: {enum_str}"
-        return result
+        return cast(str, result)
 
     return "any"
 
@@ -350,15 +355,43 @@ def build_tag_readme(tag: str, tag_desc: str, endpoints: list[dict]) -> str:
 # HTML-to-Markdown converter for Docusaurus pages
 # ---------------------------------------------------------------------------
 
+
 class DocusaurusExtractor(html.parser.HTMLParser):
     """Extracts the main article content from a Docusaurus page and converts to markdown."""
 
     BLOCK_TAGS = {
-        "p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
-        "ul", "ol", "li", "pre", "blockquote", "table", "thead",
-        "tbody", "tr", "th", "td", "hr", "br", "figure", "figcaption",
-        "details", "summary", "section", "article", "header", "footer",
-        "dl", "dt", "dd",
+        "p",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "pre",
+        "blockquote",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "th",
+        "td",
+        "hr",
+        "br",
+        "figure",
+        "figcaption",
+        "details",
+        "summary",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "dl",
+        "dt",
+        "dd",
     }
     INLINE_TAGS = {"a", "strong", "b", "em", "i", "code", "span", "img", "sup", "sub", "mark"}
     SKIP_TAGS = {"script", "style", "nav", "svg", "button", "iframe", "noscript"}
@@ -389,7 +422,7 @@ class DocusaurusExtractor(html.parser.HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
         attr_dict = dict(attrs)
-        cls = attr_dict.get("class", "")
+        cls = attr_dict.get("class") or ""
 
         if tag == "title":
             self._in_title = True
@@ -406,8 +439,14 @@ class DocusaurusExtractor(html.parser.HTMLParser):
             return
 
         # Skip breadcrumbs, pagination, edit links, ToC
-        skip_classes = ["breadcrumbs", "pagination-nav", "theme-edit-this-page",
-                        "table-of-contents", "tocCollapsible", "footer"]
+        skip_classes = [
+            "breadcrumbs",
+            "pagination-nav",
+            "theme-edit-this-page",
+            "table-of-contents",
+            "tocCollapsible",
+            "footer",
+        ]
         if any(sc in cls for sc in skip_classes):
             self._skip_depth = 1
             return
@@ -464,7 +503,7 @@ class DocusaurusExtractor(html.parser.HTMLParser):
                 self._current_line += "`"
 
         elif tag == "a":
-            href = attr_dict.get("href", "")
+            href = attr_dict.get("href") or ""
             self._tag_stack.append({"tag": "a", "href": href})
             self._current_line += "["
 
@@ -685,10 +724,7 @@ class DocusaurusExtractor(html.parser.HTMLParser):
 
     def handle_charref(self, name: str):
         try:
-            if name.startswith("x"):
-                char = chr(int(name[1:], 16))
-            else:
-                char = chr(int(name))
+            char = chr(int(name[1:], 16)) if name.startswith("x") else chr(int(name))
         except (ValueError, OverflowError):
             char = f"&#{name};"
         if self._in_code_block:
@@ -748,6 +784,7 @@ def html_to_markdown(html_content: str) -> tuple[str, str]:
 # Sitemap parsing
 # ---------------------------------------------------------------------------
 
+
 def parse_sitemap(xml_content: str) -> list[str]:
     """Extract URLs from a sitemap XML."""
     urls = []
@@ -780,11 +817,7 @@ def should_include_url(url: str) -> bool:
         if path.startswith(prefix.rstrip("/")):
             return True
 
-    for exact in GENERAL_EXACT:
-        if path == exact:
-            return True
-
-    return False
+    return any(path == exact for exact in GENERAL_EXACT)
 
 
 def url_to_filepath(url: str) -> tuple[str, str]:
@@ -809,6 +842,7 @@ def url_to_filepath(url: str) -> tuple[str, str]:
 # Sync logic
 # ---------------------------------------------------------------------------
 
+
 def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace) -> tuple[int, int, int, int]:
     """Sync OpenAPI spec to markdown. Returns (added, updated, unchanged, removed)."""
     paths = spec.get("paths", {})
@@ -831,13 +865,15 @@ def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace)
             for tag in tags:
                 if tag not in endpoints_by_tag:
                     endpoints_by_tag[tag] = []
-                endpoints_by_tag[tag].append({
-                    "path": path,
-                    "method": method,
-                    "summary": summary,
-                    "filename": filename,
-                    "operation": operation,
-                })
+                endpoints_by_tag[tag].append(
+                    {
+                        "path": path,
+                        "method": method,
+                        "summary": summary,
+                        "filename": filename,
+                        "operation": operation,
+                    }
+                )
 
     if not args.dry_run:
         os.makedirs(API_DOCS_DIR, exist_ok=True)
@@ -875,7 +911,7 @@ def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace)
                     print(f"  {'ADD' if is_new else 'UPDATE'} api/{safe_tag}/README.md")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -903,7 +939,7 @@ def sync_api(spec: dict, cache: dict, new_cache: dict, args: argparse.Namespace)
                         print(f"  {'ADD' if is_new else 'UPDATE'} api/{safe_tag}/{ep['filename']}")
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -999,9 +1035,7 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
     # Track sections for building indexes
     sections: dict[str, list[tuple[str, str, str]]] = {}  # section -> [(filename, title, slug)]
 
-    def preserve_cached_page(
-        section: str, filename: str, url: str, cache_key: str, target_path: str
-    ) -> None:
+    def preserve_cached_page(section: str, filename: str, url: str, cache_key: str, target_path: str) -> None:
         """Keep a failed page and its index entry when a local copy exists."""
         if cache_key not in cache:
             return
@@ -1012,7 +1046,7 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
         title = entry.get("title", "")
         if not title:
             try:
-                with open(target_path, "r") as f:
+                with open(target_path) as f:
                     first_line = f.readline().strip()
                 title = first_line.removeprefix("# ").strip()
             except OSError:
@@ -1020,33 +1054,26 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
         title = title or filename.replace(".md", "").replace("-", " ").title()
         entry["title"] = title
         entry["url"] = url
-        sections.setdefault(section, []).append(
-            (filename, title, filename.replace(".md", ""))
-        )
+        sections.setdefault(section, []).append((filename, title, filename.replace(".md", "")))
 
     for url in sorted(urls):
         section, filename = url_to_filepath(url)
         cache_key = f"docs:{section}:{filename}" if section else f"docs::{filename}"
 
-        if section:
-            target_dir = os.path.join(GENERAL_DOCS_DIR, section)
-        else:
-            target_dir = GENERAL_DOCS_DIR
+        target_dir = os.path.join(GENERAL_DOCS_DIR, section) if section else GENERAL_DOCS_DIR
 
         target_path = os.path.join(target_dir, filename)
 
         page_html = fetched_pages.get(url)
         if not page_html:
-            preserve_cached_page(
-                section, filename, url, cache_key, target_path)
+            preserve_cached_page(section, filename, url, cache_key, target_path)
             continue
 
         title, markdown = html_to_markdown(page_html)
         if not markdown.strip():
             if args.verbose:
                 print(f"  SKIP {section}/{filename} (empty content)")
-            preserve_cached_page(
-                section, filename, url, cache_key, target_path)
+            preserve_cached_page(section, filename, url, cache_key, target_path)
             continue
 
         # Clean title -- remove " | Immich" suffix
@@ -1057,7 +1084,9 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
 
         if section not in sections:
             sections[section] = []
-        sections[section].append((filename, title or filename.replace(".md", ""), filename.replace(".md", "")))
+        sections[section].append(
+            (filename, title or filename.replace(".md", ""), filename.replace(".md", ""))
+        )
 
         if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(target_path):
             unchanged += 1
@@ -1080,7 +1109,7 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
                     print(f"  {'ADD' if is_new else 'UPDATE'} general/{label}{filename}")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
                 "title": title,
                 "url": url,
             }
@@ -1114,7 +1143,7 @@ def sync_general_docs(cache: dict, new_cache: dict, args: argparse.Namespace) ->
                     f.write(readme_content)
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -1229,7 +1258,7 @@ def sync(args: argparse.Namespace) -> None:
     total_unchanged = api_unchanged + doc_unchanged
     total_removed = api_removed + doc_removed
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:     {total_added}")
     print(f"  Updated:   {total_updated}")
     print(f"  Unchanged: {total_unchanged}")
@@ -1237,9 +1266,7 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fetch Immich API and general docs, convert to markdown"
-    )
+    parser = argparse.ArgumentParser(description="Fetch Immich API and general docs, convert to markdown")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1250,9 +1277,7 @@ def main():
         action="store_true",
         help="Re-generate everything ignoring cache",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Detailed per-file logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

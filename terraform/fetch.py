@@ -43,7 +43,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -67,6 +67,7 @@ MAX_WORKERS = 16
 # ---------------------------------------------------------------------------
 # Common helpers
 # ---------------------------------------------------------------------------
+
 
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -97,22 +98,25 @@ def retry_wait(attempt: int, err: HTTPError | None = None) -> float:
         retry_after = err.headers.get("Retry-After")
         if retry_after:
             try:
-                return min(float(retry_after), MAX_BACKOFF)
+                return min(float(str(retry_after)), MAX_BACKOFF)
             except ValueError:
                 pass
-    return min(1.5 * (2 ** attempt), MAX_BACKOFF)
+    return float(min(1.5 * (2**attempt), MAX_BACKOFF))
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "terraform-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "terraform-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     started = time.monotonic()
     for attempt in range(MAX_RETRIES + 1):
         try:
             with urlopen(req, timeout=timeout) as resp:
-                data = resp.read()
+                data: bytes = resp.read()
                 if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
                     data = gzip.decompress(data)
                 return data.decode("utf-8")
@@ -137,8 +141,9 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -191,9 +196,7 @@ def docs_manifest_hash(docs: list[dict]) -> str:
         }
         for doc in docs
     ]
-    manifest.sort(key=lambda item: (
-        item["category"], item["slug"], item["id"], item["title"]
-    ))
+    manifest.sort(key=lambda item: (item["category"], item["slug"], item["id"], item["title"]))
     return sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
 
 
@@ -205,7 +208,10 @@ def fetch_doc_content(doc_id: str) -> dict | None:
         return None
     try:
         data = json.loads(raw)
-        return data.get("data", {}).get("attributes", {})
+        if not isinstance(data, dict):
+            return None
+        attributes = data.get("data", {}).get("attributes", {})
+        return attributes if isinstance(attributes, dict) else None
     except (json.JSONDecodeError, KeyError):
         return None
 
@@ -214,18 +220,19 @@ def fetch_doc_content(doc_id: str) -> dict | None:
 # Provider index (cached list of all registry providers)
 # ---------------------------------------------------------------------------
 
+
 def _index_is_fresh() -> bool:
     """Check if the cached provider index exists and is recent enough."""
     if not os.path.exists(INDEX_FILE):
         return False
     try:
-        with open(INDEX_FILE, "r") as f:
+        with open(INDEX_FILE) as f:
             idx = json.load(f)
         fetched = idx.get("fetched_at", "")
         if not fetched:
             return False
         dt = datetime.fromisoformat(fetched)
-        age = datetime.now(timezone.utc) - dt
+        age = datetime.now(UTC) - dt
         return age.total_seconds() < INDEX_MAX_AGE_HOURS * 3600
     except (json.JSONDecodeError, OSError, ValueError):
         return False
@@ -236,7 +243,8 @@ def _fetch_index_page(page: int, page_size: int = 100) -> dict | None:
     raw = fetch_url(url, timeout=30)
     if not raw:
         return None
-    return json.loads(raw)
+    page = json.loads(raw)
+    return page if isinstance(page, dict) else None
 
 
 def refresh_provider_index() -> list[dict]:
@@ -257,11 +265,13 @@ def refresh_provider_index() -> list[dict]:
     providers = []
     for item in first.get("data", []):
         a = item.get("attributes", {})
-        providers.append({
-            "name": a.get("full-name", ""),
-            "tier": a.get("tier", "community"),
-            "downloads": a.get("downloads", 0),
-        })
+        providers.append(
+            {
+                "name": a.get("full-name", ""),
+                "tier": a.get("tier", "community"),
+                "downloads": a.get("downloads", 0),
+            }
+        )
 
     # Fetch remaining pages concurrently
     if total_pages > 1:
@@ -272,17 +282,19 @@ def refresh_provider_index() -> list[dict]:
                 if result:
                     for item in result.get("data", []):
                         a = item.get("attributes", {})
-                        providers.append({
-                            "name": a.get("full-name", ""),
-                            "tier": a.get("tier", "community"),
-                            "downloads": a.get("downloads", 0),
-                        })
+                        providers.append(
+                            {
+                                "name": a.get("full-name", ""),
+                                "tier": a.get("tier", "community"),
+                                "downloads": a.get("downloads", 0),
+                            }
+                        )
 
     providers.sort(key=lambda p: (-p["downloads"], p["name"]))
 
     # Save index
     index = {
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total": len(providers),
         "providers": providers,
     }
@@ -297,15 +309,17 @@ def refresh_provider_index() -> list[dict]:
 def load_provider_index(force_refresh: bool = False) -> list[dict]:
     """Load provider index from cache, refreshing if stale or forced."""
     if not force_refresh and _index_is_fresh():
-        with open(INDEX_FILE, "r") as f:
+        with open(INDEX_FILE) as f:
             idx = json.load(f)
-        return idx.get("providers", [])
+        providers = idx.get("providers", []) if isinstance(idx, dict) else []
+        return providers if isinstance(providers, list) else []
     return refresh_provider_index()
 
 
 # ---------------------------------------------------------------------------
 # Interactive provider picker
 # ---------------------------------------------------------------------------
+
 
 def pick_provider_interactive(providers: list[dict]) -> str | None:
     """Let the user pick a provider interactively. Tries fzf, falls back to simple search."""
@@ -327,7 +341,9 @@ def pick_provider_interactive(providers: list[dict]) -> str | None:
     try:
         result = subprocess.run(
             ["fzf", "--prompt", "Provider> ", "--height=40%", "--reverse", "--tiebreak=index"],
-            input=text, capture_output=True, text=True,
+            input=text,
+            capture_output=True,
+            text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().split()[0]
@@ -344,10 +360,7 @@ def pick_provider_interactive(providers: list[dict]) -> str | None:
             print()
             return None
 
-        if not query:
-            matches = providers[:20]
-        else:
-            matches = [p for p in providers if query in p["name"].lower()][:20]
+        matches = providers[:20] if not query else [p for p in providers if query in p["name"].lower()][:20]
 
         if not matches:
             print("  No matches. Try again.")
@@ -359,7 +372,7 @@ def pick_provider_interactive(providers: list[dict]) -> str | None:
         if len(matches) == 1:
             confirm = input(f"\nUse {matches[0]['name']}? [Y/n] ").strip().lower()
             if confirm in ("", "y", "yes"):
-                return matches[0]["name"]
+                return str(matches[0]["name"])
             continue
 
         try:
@@ -371,7 +384,7 @@ def pick_provider_interactive(providers: list[dict]) -> str | None:
         if pick.isdigit():
             n = int(pick)
             if 1 <= n <= len(matches):
-                return matches[n - 1]["name"]
+                return str(matches[n - 1]["name"])
 
         # Otherwise treat it as a new search
         if pick:
@@ -383,6 +396,7 @@ def pick_provider_interactive(providers: list[dict]) -> str | None:
 # ---------------------------------------------------------------------------
 # Markdown formatting
 # ---------------------------------------------------------------------------
+
 
 def build_category_readme(category: str, docs: list[dict]) -> str:
     display = category.replace("-", " ").title()
@@ -397,7 +411,9 @@ def build_category_readme(category: str, docs: list[dict]) -> str:
 def build_top_readme(provider: str, version: str, categories: dict[str, list[dict]]) -> str:
     org, name = provider.split("/", 1) if "/" in provider else ("", provider)
     lines = [f"# Terraform {name.title()} Provider Documentation\n"]
-    lines.append(f"**Provider:** [{provider}](https://registry.terraform.io/providers/{provider}/latest/docs)\n")
+    lines.append(
+        f"**Provider:** [{provider}](https://registry.terraform.io/providers/{provider}/latest/docs)\n"
+    )
     lines.append(f"**Version:** {version}\n")
     lines.append("## Categories\n")
     for category in sorted(categories.keys()):
@@ -412,6 +428,7 @@ def build_top_readme(provider: str, version: str, categories: dict[str, list[dic
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
+
 
 def _provider_docs_dir(provider: str) -> str:
     """Each provider gets its own subtree: docs/{org}/{name}/. Keeps multiple
@@ -466,8 +483,10 @@ def sync(args: argparse.Namespace) -> None:
         and prev_source.get("fetcher_sha256") == fetcher_hash()
         and outputs_present(prev_source)
     ):
-        print("  version and docs manifest unchanged, all outputs present; "
-              "skipping individual document downloads")
+        print(
+            "  version and docs manifest unchanged, all outputs present; "
+            "skipping individual document downloads"
+        )
         if not args.dry_run:
             save_cache(prev_cache)
         print("\nSync complete:")
@@ -524,8 +543,7 @@ def sync(args: argparse.Namespace) -> None:
     # other providers' entries and source fingerprints always survive; this
     # provider's own source entry is re-recorded only after a full success.
     new_cache: dict = {
-        k: v for k, v in prev_cache.items()
-        if not k.startswith(cache_prefix) and k != source_key
+        k: v for k, v in prev_cache.items() if not k.startswith(cache_prefix) and k != source_key
     }
     # Track keys rebuilt this run so we know what belongs to this provider now.
     rebuilt_keys: set[str] = set()
@@ -559,19 +577,23 @@ def sync(args: argparse.Namespace) -> None:
                     new_cache[cache_key] = prev_cache[cache_key]
                     rebuilt_keys.add(cache_key)
                     unchanged += 1
-                    category_docs.setdefault(safe_category, []).append({
-                        "title": title,
-                        "filename": filename,
-                    })
+                    category_docs.setdefault(safe_category, []).append(
+                        {
+                            "title": title,
+                            "filename": filename,
+                        }
+                    )
                 continue
 
             content_hash = sha256(content)
             rebuilt_keys.add(cache_key)
 
-            category_docs.setdefault(safe_category, []).append({
-                "title": title,
-                "filename": filename,
-            })
+            category_docs.setdefault(safe_category, []).append(
+                {
+                    "title": title,
+                    "filename": filename,
+                }
+            )
 
             if cache.get(cache_key, {}).get("sha256") == content_hash and os.path.exists(file_path):
                 unchanged += 1
@@ -588,7 +610,7 @@ def sync(args: argparse.Namespace) -> None:
                         print(f"  {'ADD' if is_new else 'UPDATE'} {safe_category}/{filename}")
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -617,7 +639,7 @@ def sync(args: argparse.Namespace) -> None:
                         print(f"  {'ADD' if is_new else 'UPDATE'} {safe_category}/README.md")
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -640,7 +662,7 @@ def sync(args: argparse.Namespace) -> None:
             continue
         if old_key in rebuilt_keys:
             continue
-        relative = old_key[len(cache_prefix):]
+        relative = old_key[len(cache_prefix) :]
         parts = relative.split(":", 1)
         if len(parts) == 2:
             cat_dir, fname = parts
@@ -670,9 +692,8 @@ def sync(args: argparse.Namespace) -> None:
         if len(doc_contents) == len(docs):
             outputs = [os.path.relpath(top_readme_path, DOCS_DIR)]
             for key in rebuilt_keys:
-                cat_dir, fname = key[len(cache_prefix):].split(":", 1)
-                outputs.append(os.path.relpath(
-                    os.path.join(provider_docs_dir, cat_dir, fname), DOCS_DIR))
+                cat_dir, fname = key[len(cache_prefix) :].split(":", 1)
+                outputs.append(os.path.relpath(os.path.join(provider_docs_dir, cat_dir, fname), DOCS_DIR))
             new_cache[source_key] = {
                 "version": latest_version,
                 "manifest_sha256": manifest_hash,
@@ -683,7 +704,7 @@ def sync(args: argparse.Namespace) -> None:
 
     total_docs = sum(len(d) for d in category_docs.values())
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:        {added}")
     print(f"  Updated:      {updated}")
     print(f"  Unchanged:    {unchanged}")
@@ -711,9 +732,7 @@ def main():
         action="store_true",
         help="Re-generate everything ignoring cache",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Detailed per-file logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
 
     if not args.provider:

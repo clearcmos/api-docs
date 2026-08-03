@@ -23,7 +23,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -41,9 +41,7 @@ def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def fetch_url(
-    url: str, timeout: int = 60, etag: str | None = None
-) -> tuple[str | None, str | None, bool]:
+def fetch_url(url: str, timeout: int = 60, etag: str | None = None) -> tuple[str | None, str | None, bool]:
     headers = {
         "User-Agent": "openai-api-docs-fetcher/1.0",
         "Accept-Encoding": "gzip",
@@ -53,7 +51,7 @@ def fetch_url(
     req = Request(url, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8"), resp.headers.get("ETag"), False
@@ -71,8 +69,9 @@ def fetch_url(
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -98,9 +97,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # Index parsing
 # ---------------------------------------------------------------------------
 
-LINK_RE = re.compile(
-    r"^- \[([^\]]+)\]\((https://developers\.openai\.com/[^)]+)\)\s*(?::\s*(.*))?$"
-)
+LINK_RE = re.compile(r"^- \[([^\]]+)\]\((https://developers\.openai\.com/[^)]+)\)\s*(?::\s*(.*))?$")
 
 
 def parse_llms_index(text: str) -> list[dict]:
@@ -117,18 +114,20 @@ def parse_llms_index(text: str) -> list[dict]:
             continue
         m = LINK_RE.match(line)
         if m:
-            entries.append({
-                "section": section,
-                "title": m.group(1).strip(),
-                "url": m.group(2).strip(),
-                "summary": (m.group(3) or "").strip(),
-            })
+            entries.append(
+                {
+                    "section": section,
+                    "title": m.group(1).strip(),
+                    "url": m.group(2).strip(),
+                    "summary": (m.group(3) or "").strip(),
+                }
+            )
     return entries
 
 
 def url_rel_path(url: str) -> str:
     """Return the URL path relative to SITE, e.g. 'api/docs/guides/agents.md'."""
-    return url[len(SITE) + 1:]
+    return url[len(SITE) + 1 :]
 
 
 def file_path_for_url(url: str) -> str:
@@ -145,6 +144,7 @@ def top_segment(url: str) -> str:
 # ---------------------------------------------------------------------------
 # Page formatting
 # ---------------------------------------------------------------------------
+
 
 def build_page_markdown(raw: str, title: str, source_url: str) -> str:
     body = raw.rstrip() + "\n"
@@ -212,7 +212,11 @@ def build_product_readme(top: str, entries: list[dict]) -> str:
         lines.append("")
         for e in sorted(sections[section], key=lambda x: x["title"].lower()):
             # path relative to docs/{top}/
-            rel_from_top = url_rel_path(e["url"])[len(top) + 1:] if url_rel_path(e["url"]).startswith(top + "/") else url_rel_path(e["url"])
+            rel_from_top = (
+                url_rel_path(e["url"])[len(top) + 1 :]
+                if url_rel_path(e["url"]).startswith(top + "/")
+                else url_rel_path(e["url"])
+            )
             line = f"- [{e['title']}](./{rel_from_top})"
             if e["summary"]:
                 line += f" - {e['summary']}"
@@ -224,6 +228,7 @@ def build_product_readme(top: str, entries: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
+
 
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
@@ -262,9 +267,7 @@ def sync(args: argparse.Namespace) -> None:
     validated: dict[str, str | None] = {}
     missing: list[str] = []
 
-    def fetch_one(
-        entry: dict
-    ) -> tuple[dict, str | None, str | None, bool]:
+    def fetch_one(entry: dict) -> tuple[dict, str | None, str | None, bool]:
         url = entry["url"]
         cache_key = url_rel_path(url)
         file_path = file_path_for_url(url)
@@ -336,7 +339,7 @@ def sync(args: argparse.Namespace) -> None:
         write_file(file_path, content, dry_run=args.dry_run, verbose=args.verbose, label=label)
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
             "etag": etag,
         }
         if is_new:
@@ -356,11 +359,16 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[cache_key] = prev
             continue
         is_new = cache_key not in cache or not os.path.exists(readme_path)
-        write_file(readme_path, readme_content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            readme_path,
+            readme_content,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[cache_key] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -378,11 +386,16 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[top_key] = prev
     else:
         is_new = top_key not in cache or not os.path.exists(top_path)
-        write_file(top_path, top_readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            top_path,
+            top_readme,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            label="ADD" if is_new else "UPDATE",
+        )
         new_cache[top_key] = {
             "sha256": top_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -395,7 +408,7 @@ def sync(args: argparse.Namespace) -> None:
         if old_key in new_cache:
             continue
         if old_key.startswith("__readme__/"):
-            name = old_key[len("__readme__/"):]
+            name = old_key[len("__readme__/") :]
             if name == "_top":
                 old_path = os.path.join(DOCS_DIR, "README.md")
             else:
@@ -438,12 +451,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch OpenAI Developers documentation and mirror to local markdown"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

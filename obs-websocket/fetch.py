@@ -13,6 +13,7 @@ Source:
 This is the runtime remote-control protocol, distinct from the sibling `obs/` fetcher,
 which mirrors the libobs C plugin/scripting API.
 """
+
 import argparse
 import gzip
 import hashlib
@@ -20,7 +21,8 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -43,13 +45,16 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8")
@@ -63,8 +68,8 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -141,7 +146,9 @@ def render_request(r: dict) -> str:
         out.append("| Name | Type | Required | Description |\n| --- | --- | --- | --- |\n")
         for f in fields:
             req = "No" if f.get("valueOptional") else "Yes"
-            out.append(f"| `{esc(f['valueName'])}` | {esc(f['valueType'])} | {req} | {request_field_desc(f)} |\n")
+            out.append(
+                f"| `{esc(f['valueName'])}` | {esc(f['valueType'])} | {req} | {request_field_desc(f)} |\n"
+            )
         out.append("\n")
     else:
         out.append("_None._\n\n")
@@ -150,7 +157,9 @@ def render_request(r: dict) -> str:
     if resp:
         out.append("| Name | Type | Description |\n| --- | --- | --- |\n")
         for f in resp:
-            out.append(f"| `{esc(f['valueName'])}` | {esc(f['valueType'])} | {esc(f.get('valueDescription'))} |\n")
+            out.append(
+                f"| `{esc(f['valueName'])}` | {esc(f['valueType'])} | {esc(f.get('valueDescription'))} |\n"
+            )
         out.append("\n")
     else:
         out.append("_None._\n\n")
@@ -166,7 +175,9 @@ def render_event(e: dict) -> str:
     if fields:
         out.append("| Name | Type | Description |\n| --- | --- | --- |\n")
         for f in fields:
-            out.append(f"| `{esc(f['valueName'])}` | {esc(f['valueType'])} | {esc(f.get('valueDescription'))} |\n")
+            out.append(
+                f"| `{esc(f['valueName'])}` | {esc(f['valueType'])} | {esc(f.get('valueDescription'))} |\n"
+            )
         out.append("\n")
     else:
         out.append("_None._\n\n")
@@ -322,9 +333,10 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[rel] = prev
             continue
         is_new = rel not in cache or not os.path.exists(path)
-        write_file(path, content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
-        new_cache[rel] = {"sha256": content_hash, "last_updated": datetime.now(timezone.utc).isoformat()}
+        write_file(
+            path, content, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+        )
+        new_cache[rel] = {"sha256": content_hash, "last_updated": datetime.now(UTC).isoformat()}
         if is_new:
             added += 1
         else:
@@ -348,7 +360,7 @@ def sync(args: argparse.Namespace) -> None:
 
     if not args.dry_run:
         # prune now-empty category directories
-        for root, dirs, filenames in os.walk(DOCS_DIR, topdown=False):
+        for root, _dirs, filenames in os.walk(DOCS_DIR, topdown=False):
             if not filenames and not os.listdir(root) and root != DOCS_DIR:
                 os.rmdir(root)
         save_cache(new_cache)

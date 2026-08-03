@@ -41,7 +41,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -58,10 +58,21 @@ MAX_WORKERS = 24
 # /youtube/v3/docs index. Discovered by probing /youtube/v3/docs/{name}.
 # Anything else is derived from the method URLs themselves.
 EXTRA_RESOURCE_PAGES = (
-    "activities", "captions", "channelBanners", "channelSections",
-    "commentThreads", "i18nLanguages", "i18nRegions", "members",
-    "membershipsLevels", "playlistItems", "search", "subscriptions",
-    "thumbnails", "videoAbuseReportReasons", "videoCategories",
+    "activities",
+    "captions",
+    "channelBanners",
+    "channelSections",
+    "commentThreads",
+    "i18nLanguages",
+    "i18nRegions",
+    "members",
+    "membershipsLevels",
+    "playlistItems",
+    "search",
+    "subscriptions",
+    "thumbnails",
+    "videoAbuseReportReasons",
+    "videoCategories",
 )
 
 # Auxiliary pages directly under /youtube/v3/docs/.
@@ -72,18 +83,22 @@ EXTRA_PATHS = ("errors",)
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "youtube-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "youtube-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8", errors="replace")
@@ -99,8 +114,9 @@ def fetch_url(url: str, timeout: int = 60) -> str | None:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -126,10 +142,11 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # URL discovery
 # ---------------------------------------------------------------------------
 
+
 def extract_doc_urls(index_html: str) -> set[str]:
     """Pull all /youtube/v3/docs/* link targets out of the article body."""
     m = re.search(r'<div class="devsite-article-body[^"]*"[^>]*>', index_html)
-    body = index_html[m.start():] if m else index_html
+    body = index_html[m.start() :] if m else index_html
     paths = set(re.findall(r'href="(/youtube/v3/docs/[^"#?]+)"', body))
     # Normalize trailing slashes.
     return {p.rstrip("/") for p in paths}
@@ -140,7 +157,7 @@ def derive_resource_paths(method_paths: set[str]) -> set[str]:
     /youtube/v3/docs/{resource} parents."""
     resources = set()
     for p in method_paths:
-        tail = p[len("/youtube/v3/docs/"):]
+        tail = p[len("/youtube/v3/docs/") :]
         if "/" in tail:
             resource = tail.split("/", 1)[0]
             resources.add(f"/youtube/v3/docs/{resource}")
@@ -172,17 +189,17 @@ def plan_pages() -> list[tuple[str, str]]:
 
     # Auxiliary pages (errors).
     for path in sorted(extra_paths):
-        name = path[len("/youtube/v3/docs/"):]
+        name = path[len("/youtube/v3/docs/") :]
         plan.append((SITE + path, f"{name}.md"))
 
     # Resource overview pages.
     for path in sorted(resource_paths):
-        resource = path[len("/youtube/v3/docs/"):]
+        resource = path[len("/youtube/v3/docs/") :]
         plan.append((SITE + path, f"{resource}/index.md"))
 
     # Method pages.
     for path in sorted(method_paths):
-        tail = path[len("/youtube/v3/docs/"):]
+        tail = path[len("/youtube/v3/docs/") :]
         if "/" not in tail:
             # Already covered by resource overview pages above.
             continue
@@ -198,8 +215,23 @@ def plan_pages() -> list[tuple[str, str]]:
 # HTML to Markdown converter
 # ---------------------------------------------------------------------------
 
-INLINE_TAGS = {"a", "code", "strong", "b", "em", "i", "span", "sup", "sub", "s",
-               "tt", "var", "kbd", "mark", "small"}
+INLINE_TAGS = {
+    "a",
+    "code",
+    "strong",
+    "b",
+    "em",
+    "i",
+    "span",
+    "sup",
+    "sub",
+    "s",
+    "tt",
+    "var",
+    "kbd",
+    "mark",
+    "small",
+}
 
 
 class DevsiteExtractor(html.parser.HTMLParser):
@@ -212,21 +244,36 @@ class DevsiteExtractor(html.parser.HTMLParser):
     block structure as markdown.
     """
 
-    SKIP_TAGS = {"style", "script", "noscript", "devsite-iframe", "iframe",
-                 "devsite-toc", "devsite-content-footer", "devsite-thumb-rating"}
+    SKIP_TAGS = {
+        "style",
+        "script",
+        "noscript",
+        "devsite-iframe",
+        "iframe",
+        "devsite-toc",
+        "devsite-content-footer",
+        "devsite-thumb-rating",
+    }
 
     # Classes that turn a <div>/<aside> into a blockquote-style callout.
     # The original HTML already contains its own label (e.g. "<b>Note:</b>"),
     # so we only need to wrap subsequent flushed lines in "> " quoting.
     NOTE_CLASSES = {
-        "note", "caution", "warning", "tip", "key-point", "key-term",
-        "objective", "success", "beta",
+        "note",
+        "caution",
+        "warning",
+        "tip",
+        "key-point",
+        "key-term",
+        "objective",
+        "success",
+        "beta",
     }
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self._in_body = False
-        self._body_depth = 0          # nesting depth of divs while inside body
+        self._body_depth = 0  # nesting depth of divs while inside body
         self._skip_depth = 0
         self._skip_tag: str | None = None  # tag name that opened the skip
 
@@ -497,10 +544,7 @@ class DevsiteExtractor(html.parser.HTMLParser):
                 self._list_stack.append(["ul", 0])
             self._list_stack[-1][1] += 1
             indent = "  " * (len(self._list_stack) - 1)
-            if self._list_stack[-1][0] == "ol":
-                marker = f"{self._list_stack[-1][1]}. "
-            else:
-                marker = "- "
+            marker = f"{self._list_stack[-1][1]}. " if self._list_stack[-1][0] == "ol" else "- "
             self._current_line = indent + marker
             return
 
@@ -542,7 +586,7 @@ class DevsiteExtractor(html.parser.HTMLParser):
         if tag in ("td", "th"):
             if self._in_table:
                 self._current_cell = []
-                self._cell_is_header = (tag == "th" or self._in_thead)
+                self._cell_is_header = tag == "th" or self._in_thead
                 self._cell_buffer_target = "cell"
                 try:
                     self._cell_colspan = int(a.get("colspan") or "1")
@@ -688,11 +732,13 @@ class DevsiteExtractor(html.parser.HTMLParser):
                 text = "".join(self._current_cell).strip()
                 # Collapse whitespace inside cells.
                 text = re.sub(r"\s+", " ", text)
-                self._current_row.append({
-                    "text": text,
-                    "is_header": self._cell_is_header,
-                    "colspan": self._cell_colspan,
-                })
+                self._current_row.append(
+                    {
+                        "text": text,
+                        "is_header": self._cell_is_header,
+                        "colspan": self._cell_colspan,
+                    }
+                )
                 self._current_cell = []
                 self._cell_buffer_target = None
                 self._cell_colspan = 1
@@ -752,9 +798,8 @@ class DevsiteExtractor(html.parser.HTMLParser):
         # parameter-name + description. Render dividers as bold headings
         # and data rows as a definition-list block, since the description
         # cell often contains lists/code which break markdown tables.
-        is_definition_style = (
-            any(len(r) == 1 and r[0].get("colspan", 1) >= 2 for r in rows)
-            or all(len(r) <= 2 for r in rows)
+        is_definition_style = any(len(r) == 1 and r[0].get("colspan", 1) >= 2 for r in rows) or all(
+            len(r) <= 2 for r in rows
         )
 
         if is_definition_style:
@@ -822,9 +867,7 @@ class DevsiteExtractor(html.parser.HTMLParser):
         if re.match(r"^\s*-\s*$", stripped + " "):
             return True
         # Numeric marker: optional indent + "N. "
-        if re.match(r"^\s*\d+\.\s*$", stripped + " "):
-            return True
-        return False
+        return bool(re.match(r"^\s*\d+\.\s*$", stripped + " "))
 
     # ------------------------------------------------------------------
     # Link normalization
@@ -902,13 +945,14 @@ def html_to_markdown(html_text: str, source_url: str) -> str | None:
 # README generation
 # ---------------------------------------------------------------------------
 
+
 def build_resource_readme(resource: str, methods: list[str]) -> str:
     lines = [f"# {resource}", ""]
     lines.append(f"Source: {SITE}/youtube/v3/docs/{resource}")
     lines.append("")
     lines.append("## Methods")
     lines.append("")
-    lines.append(f"- [Resource overview](./index.md)")
+    lines.append("- [Resource overview](./index.md)")
     for m in sorted(methods):
         lines.append(f"- [{m}](./{m}.md)")
     lines.append("")
@@ -945,6 +989,7 @@ def build_top_readme(resources: dict[str, list[str]], extras: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
+
 
 def fetch_page(url: str, out_rel: str, verbose: bool) -> tuple[str, str, str | None]:
     html = fetch_url(url)
@@ -996,12 +1041,11 @@ def sync(args: argparse.Namespace) -> None:
             else:
                 is_new = rel not in cache or not os.path.exists(out_path)
                 label = "ADD" if is_new else "UPDATE"
-                write_file(out_path, content, dry_run=args.dry_run,
-                           verbose=args.verbose, label=label)
+                write_file(out_path, content, dry_run=args.dry_run, verbose=args.verbose, label=label)
                 new_cache[rel] = {
                     "sha256": h,
                     "url": url,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -1035,11 +1079,12 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[rel] = cached
             continue
         is_new = rel not in cache or not os.path.exists(out_path)
-        write_file(out_path, readme, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            out_path, readme, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+        )
         new_cache[rel] = {
             "sha256": h,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -1057,11 +1102,12 @@ def sync(args: argparse.Namespace) -> None:
         new_cache[rel] = cached
     else:
         is_new = rel not in cache or not os.path.exists(out_path)
-        write_file(out_path, top, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            out_path, top, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+        )
         new_cache[rel] = {
             "sha256": h,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -1100,16 +1146,14 @@ def sync(args: argparse.Namespace) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Sync YouTube Data API v3 reference docs to markdown",
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-download everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-page logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-download everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-page logging")
     args = parser.parse_args()
     sync(args)
 

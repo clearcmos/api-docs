@@ -69,13 +69,13 @@ import posixpath
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 BASE_URL = "https://dev.twitch.tv"
-API_ROOT = "/docs/api"               # crawl prefix, normalized (no trailing /)
+API_ROOT = "/docs/api"  # crawl prefix, normalized (no trailing /)
 REFERENCE_PATH = "/docs/api/reference"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(SCRIPT_DIR, "docs")
@@ -87,18 +87,22 @@ USER_AGENT = "twitch-api-docs-fetcher/1.0"
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data.decode("utf-8", errors="replace")
@@ -115,8 +119,9 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -157,9 +162,25 @@ def page_source_url(path: str) -> str:
 # HTML -> markdown converter
 # ---------------------------------------------------------------------------
 
-BLOCK_TAGS = {"p", "pre", "figure", "table", "ul", "ol", "hr", "blockquote",
-              "div", "details", "summary",
-              "h1", "h2", "h3", "h4", "h5", "h6"}
+BLOCK_TAGS = {
+    "p",
+    "pre",
+    "figure",
+    "table",
+    "ul",
+    "ol",
+    "hr",
+    "blockquote",
+    "div",
+    "details",
+    "summary",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+}
 SKIP_TAGS = {"script", "style", "noscript", "svg", "button", "iframe", "nav"}
 INLINE_END_TAGS = {"strong", "b", "em", "i", "small", "a", "span"}
 
@@ -178,16 +199,16 @@ class MarkdownConverter(html.parser.HTMLParser):
         self.heading_offset = heading_offset
         self.lines: list[str] = []
 
-        self._line = ""                 # pending inline text for current block
-        self._skip_depth = 0            # >0 while inside SKIP_TAGS / editor links
+        self._line = ""  # pending inline text for current block
+        self._skip_depth = 0  # >0 while inside SKIP_TAGS / editor links
         self._skip_tag: str | None = None
-        self._bq_depth = 0              # blockquote nesting
+        self._bq_depth = 0  # blockquote nesting
 
         # Code-block state.
         self._pre_depth = 0
         self._code_buf = ""
         self._code_lang = ""
-        self._pending_lang = ""         # from <div class="language-X highlighter-rouge">
+        self._pending_lang = ""  # from <div class="language-X highlighter-rouge">
 
         # List state: stack of [kind, counter]; kind is "ul" or "ol".
         self._list_stack: list[list] = []
@@ -198,7 +219,7 @@ class MarkdownConverter(html.parser.HTMLParser):
 
         # Inline emphasis: stack of closing markers, popped on end tags.
         self._inline_stack: list[str] = []
-        self._code_inline_depth = 0     # inside inline <code>
+        self._code_inline_depth = 0  # inside inline <code>
 
         # Table state.
         self._in_table = False
@@ -212,7 +233,7 @@ class MarkdownConverter(html.parser.HTMLParser):
     def _emit(self, text: str):
         if self._bq_depth:
             prefix = "> " * self._bq_depth
-            text = "\n".join((prefix + l).rstrip() for l in text.split("\n"))
+            text = "\n".join((prefix + line).rstrip() for line in text.split("\n"))
         self.lines.append(text)
         self.lines.append("")
 
@@ -236,8 +257,9 @@ class MarkdownConverter(html.parser.HTMLParser):
         a = {k: (v or "") for k, v in attrs}
         cls = a.get("class", "")
 
-        if tag in SKIP_TAGS or (tag == "a" and (
-                "editor-link" in cls or a.get("href", "").startswith("cloudcannon:"))):
+        if tag in SKIP_TAGS or (
+            tag == "a" and ("editor-link" in cls or a.get("href", "").startswith("cloudcannon:"))
+        ):
             self._skip_depth = 1
             self._skip_tag = tag
             return
@@ -431,9 +453,8 @@ class MarkdownConverter(html.parser.HTMLParser):
             self._bq_depth = max(0, self._bq_depth - 1)
             return
 
-        if tag in ("p", "summary", "figure", "div", "details"):
-            if not self._in_table:
-                self._flush_line()
+        if tag in ("p", "summary", "figure", "div", "details") and not self._in_table:
+            self._flush_line()
 
     def handle_data(self, data):
         if self._skip_depth > 0:
@@ -473,7 +494,8 @@ class MarkdownConverter(html.parser.HTMLParser):
     def _start_list_item(self):
         self._flush_line()
         depth = max(0, len(self._list_stack) - 1)
-        kind, counter = self._list_stack[-1] if self._list_stack else ["ul", 0]
+        kind = str(self._list_stack[-1][0]) if self._list_stack else "ul"
+        counter = int(self._list_stack[-1][1]) if self._list_stack else 0
         if kind == "ol":
             counter += 1
             self._list_stack[-1][1] = counter
@@ -520,7 +542,7 @@ class MarkdownConverter(html.parser.HTMLParser):
         lead = re.match(r"^[\xa0 ]+", cell)
         if lead:
             indent = "\xa0" * lead.group(0).count("\xa0")
-            cell = cell[lead.end():]
+            cell = cell[lead.end() :]
         cell = cell.replace("\xa0", " ").replace("\n", " ")
         cell = re.sub(r"(\s*<br>\s*)+", "<br>", cell)
         cell = re.sub(r"[ \t]+", " ", cell).strip()
@@ -536,8 +558,7 @@ class MarkdownConverter(html.parser.HTMLParser):
             return
         ncol = max(len(header), *(len(r) for r in rows)) if rows else len(header)
         header = header + [""] * (ncol - len(header))
-        out = ["| " + " | ".join(header) + " |",
-               "|" + "|".join(["---"] * ncol) + "|"]
+        out = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * ncol) + "|"]
         for r in rows:
             r = r + [""] * (ncol - len(r))
             out.append("| " + " | ".join(r) + " |")
@@ -563,8 +584,10 @@ class MarkdownConverter(html.parser.HTMLParser):
 # Link rewriting
 # ---------------------------------------------------------------------------
 
-def make_rewriter(cur_rel: str, cur_page_path: str, page_files: dict,
-                  endpoint_files: dict, on_reference: bool):
+
+def make_rewriter(
+    cur_rel: str, cur_page_path: str, page_files: dict, endpoint_files: dict, on_reference: bool
+):
     """Build the href-rewriting callable for one output file.
 
     cur_rel        -- output path relative to docs/ (posix), e.g. "guide.md"
@@ -616,12 +639,13 @@ def make_rewriter(cur_rel: str, cur_page_path: str, page_files: dict,
 # Page discovery and extraction
 # ---------------------------------------------------------------------------
 
+
 def main_content(page_html: str) -> str:
     start = page_html.find('<div class="main"')
     if start < 0:
         return page_html
     end = page_html.find("<footer", start)
-    return page_html[start:end if end > start else len(page_html)]
+    return page_html[start : end if end > start else len(page_html)]
 
 
 def extract_api_links(fragment: str) -> set[str]:
@@ -643,12 +667,10 @@ def crawl_pages(verbose: bool) -> dict[str, str]:
         if not batch:
             break
         with ThreadPoolExecutor(max_workers=6) as ex:
-            results = list(ex.map(
-                lambda p: (p, fetch_url(page_source_url(p))), batch))
+            results = list(ex.map(lambda p: (p, fetch_url(page_source_url(p))), batch))
         for path, text in results:
             if text is None:
-                print(f"ERROR: aborting, page failed to fetch: {path}",
-                      file=sys.stderr)
+                print(f"ERROR: aborting, page failed to fetch: {path}", file=sys.stderr)
                 sys.exit(1)
             if verbose:
                 print(f"  fetched {path} ({len(text)} bytes)")
@@ -659,15 +681,12 @@ def crawl_pages(verbose: bool) -> dict[str, str]:
 
 def parse_sidebar(landing_html: str) -> list[tuple[str, str]]:
     """Ordered (path, label) for the Twitch API sidebar sub-pages."""
-    m = re.search(
-        r'<dt>\s*<a href="/docs/api/"[^>]*>Twitch API</a>\s*</dt>(.*?)</dl>',
-        landing_html, re.S)
+    m = re.search(r'<dt>\s*<a href="/docs/api/"[^>]*>Twitch API</a>\s*</dt>(.*?)</dl>', landing_html, re.S)
     if not m:
         return []
     out: list[tuple[str, str]] = []
     seen = set()
-    for href, label in re.findall(
-            r'<a class="sub-page" href="([^"#]+)"[^>]*>([^<]+)</a>', m.group(1)):
+    for href, label in re.findall(r'<a class="sub-page" href="([^"#]+)"[^>]*>([^<]+)</a>', m.group(1)):
         path = normalize_doc_path(href)
         if (path == API_ROOT or path.startswith(API_ROOT + "/")) and path not in seen:
             seen.add(path)
@@ -693,7 +712,7 @@ def page_title(fragment: str, page_html: str) -> str:
 
 
 def page_slug(path: str) -> str:
-    relative = path[len(API_ROOT):].strip("/")
+    relative = path[len(API_ROOT) :].strip("/")
     if not relative:
         return "index"
     return "/".join(sanitize_filename(seg) or "page" for seg in relative.split("/"))
@@ -702,6 +721,7 @@ def page_slug(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Reference page parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_reference(page_html: str):
     """Returns (index_rows, endpoints).
@@ -712,14 +732,13 @@ def parse_reference(page_html: str):
     """
     chunks = page_html.split('<section class="doc-content">')
     if len(chunks) < 3:
-        print("ERROR: reference page structure changed (no doc-content sections)",
-              file=sys.stderr)
+        print("ERROR: reference page structure changed (no doc-content sections)", file=sys.stderr)
         sys.exit(1)
 
     index_rows = []
     for res, anchor, title, desc in re.findall(
-            r'<td>([^<]*)</td>\s*<td><a href="#([^"]+)">([^<]+)</a></td>\s*<td>(.*?)</td>',
-            chunks[1], re.S):
+        r'<td>([^<]*)</td>\s*<td><a href="#([^"]+)">([^<]+)</a></td>\s*<td>(.*?)</td>', chunks[1], re.S
+    ):
         index_rows.append((clean_text(res), anchor, clean_text(title), strip_tags(desc)))
 
     endpoints = []
@@ -732,24 +751,27 @@ def parse_reference(page_html: str):
         left_html = chunk[left_start:left_end] if left_start >= 0 else ""
         h2_end = left_html.find("</h2>")
         if h2_end >= 0:
-            left_html = left_html[h2_end + len("</h2>"):]
+            left_html = left_html[h2_end + len("</h2>") :]
         right_start = chunk.find('<section class="right-code">')
         right_html = ""
         if right_start >= 0:
             right_end = chunk.find("</section>", right_start)
-            right_html = chunk[chunk.find(">", right_start) + 1:right_end]
-        endpoints.append({
-            "anchor": m.group(1),
-            "title": strip_tags(m.group(2)),
-            "left_html": left_html,
-            "right_html": right_html,
-        })
+            right_html = chunk[chunk.find(">", right_start) + 1 : right_end]
+        endpoints.append(
+            {
+                "anchor": m.group(1),
+                "title": strip_tags(m.group(2)),
+                "left_html": left_html,
+                "right_html": right_html,
+            }
+        )
     return index_rows, endpoints
 
 
 # ---------------------------------------------------------------------------
 # Markdown assembly
 # ---------------------------------------------------------------------------
+
 
 def convert_fragment(fragment: str, rewriter, heading_offset: int = 0) -> str:
     conv = MarkdownConverter(rewriter, heading_offset)
@@ -758,12 +780,13 @@ def convert_fragment(fragment: str, rewriter, heading_offset: int = 0) -> str:
     return conv.markdown()
 
 
-def build_guide_page(path: str, fragment: str, title: str, cur_rel: str,
-                     page_files: dict, endpoint_files: dict) -> str:
+def build_guide_page(
+    path: str, fragment: str, title: str, cur_rel: str, page_files: dict, endpoint_files: dict
+) -> str:
     # Drop the page's own <h1>; it becomes the file title below.
     m = re.search(r"<h1[^>]*>.*?</h1>", fragment, re.S)
     if m:
-        fragment = fragment[m.end():]
+        fragment = fragment[m.end() :]
     rewriter = make_rewriter(cur_rel, path, page_files, endpoint_files, False)
     body = convert_fragment(fragment, rewriter)
     src = page_source_url(path)
@@ -773,19 +796,15 @@ def build_guide_page(path: str, fragment: str, title: str, cur_rel: str,
     return "\n".join(parts).rstrip() + "\n"
 
 
-def build_endpoint_page(ep: dict, resource: str, cur_rel: str,
-                        page_files: dict, endpoint_files: dict) -> str:
-    rewriter = make_rewriter(cur_rel, REFERENCE_PATH, page_files,
-                             endpoint_files, True)
+def build_endpoint_page(ep: dict, resource: str, cur_rel: str, page_files: dict, endpoint_files: dict) -> str:
+    rewriter = make_rewriter(cur_rel, REFERENCE_PATH, page_files, endpoint_files, True)
     body = convert_fragment(ep["left_html"], rewriter, heading_offset=-1)
     if ep["right_html"]:
         examples = convert_fragment(ep["right_html"], rewriter, heading_offset=-1)
         if examples:
             body = f"{body}\n\n{examples}" if body else examples
     src = f"{BASE_URL}{REFERENCE_PATH}#{ep['anchor']}"
-    parts = [f"# {ep['title']}\n",
-             f"**Resource:** {resource}\n",
-             f"Source: [{src}]({src})\n"]
+    parts = [f"# {ep['title']}\n", f"**Resource:** {resource}\n", f"Source: [{src}]({src})\n"]
     if body:
         parts.append(body)
     return "\n".join(parts).rstrip() + "\n"
@@ -793,10 +812,12 @@ def build_endpoint_page(ep: dict, resource: str, cur_rel: str,
 
 def build_resource_readme(resource: str, entries: list[dict]) -> str:
     src = f"{BASE_URL}{REFERENCE_PATH}/"
-    lines = [f"# {resource}\n",
-             f"Twitch API Reference: {resource} endpoints.\n",
-             f"Source: [{src}]({src})\n",
-             "## Endpoints\n"]
+    lines = [
+        f"# {resource}\n",
+        f"Twitch API Reference: {resource} endpoints.\n",
+        f"Source: [{src}]({src})\n",
+        "## Endpoints\n",
+    ]
     for e in entries:
         desc = f": {e['description']}" if e["description"] else ""
         lines.append(f"- [{e['title']}](./{e['filename']}){desc}")
@@ -807,13 +828,15 @@ def build_resource_readme(resource: str, entries: list[dict]) -> str:
 def build_reference_readme(resources: list[tuple[str, str, list[dict]]]) -> str:
     src = f"{BASE_URL}{REFERENCE_PATH}/"
     total = sum(len(entries) for _, _, entries in resources)
-    lines = ["# Twitch API Reference\n",
-             "Helix endpoints, served under `https://api.twitch.tv/helix/`. "
-             "Each endpoint's page lists its required OAuth authorization, URL, "
-             "parameters, response body, response codes, and examples.\n",
-             f"Source: [{src}]({src})\n",
-             f"**Endpoints documented:** {total}\n",
-             "## Resources\n"]
+    lines = [
+        "# Twitch API Reference\n",
+        "Helix endpoints, served under `https://api.twitch.tv/helix/`. "
+        "Each endpoint's page lists its required OAuth authorization, URL, "
+        "parameters, response body, response codes, and examples.\n",
+        f"Source: [{src}]({src})\n",
+        f"**Endpoints documented:** {total}\n",
+        "## Resources\n",
+    ]
     for resource, slug, entries in resources:
         lines.append(f"- [{resource}](./{slug}/README.md) ({len(entries)} endpoints)")
     lines.append("")
@@ -826,24 +849,26 @@ def build_reference_readme(resources: list[tuple[str, str, list[dict]]]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_top_readme(guides: list[dict],
-                     resources: list[tuple[str, str, list[dict]]]) -> str:
+def build_top_readme(guides: list[dict], resources: list[tuple[str, str, list[dict]]]) -> str:
     src = page_source_url(API_ROOT)
     total = sum(len(entries) for _, _, entries in resources)
-    lines = ["# Twitch API Documentation\n",
-             "Documentation for the Twitch API (Helix): guides plus the full "
-             "endpoint reference, scraped from dev.twitch.tv.\n",
-             f"Source: [{src}]({src})\n",
-             "## Guides\n"]
+    lines = [
+        "# Twitch API Documentation\n",
+        "Documentation for the Twitch API (Helix): guides plus the full "
+        "endpoint reference, scraped from dev.twitch.tv.\n",
+        f"Source: [{src}]({src})\n",
+        "## Guides\n",
+    ]
     for g in guides:
         lines.append(f"- [{g['title']}](./{g['filename']})")
     lines.append("")
     lines.append("## Reference\n")
-    lines.append(f"[Full endpoint index](./reference/README.md): {total} endpoints "
-                 f"across {len(resources)} resources.\n")
+    lines.append(
+        f"[Full endpoint index](./reference/README.md): {total} endpoints "
+        f"across {len(resources)} resources.\n"
+    )
     for resource, slug, entries in resources:
-        lines.append(f"- [{resource}](./reference/{slug}/README.md) "
-                     f"({len(entries)} endpoints)")
+        lines.append(f"- [{resource}](./reference/{slug}/README.md) ({len(entries)} endpoints)")
     lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -851,6 +876,7 @@ def build_top_readme(guides: list[dict],
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
+
 
 def sync(args: argparse.Namespace) -> None:
     cache = {} if args.force else load_cache()
@@ -863,18 +889,18 @@ def sync(args: argparse.Namespace) -> None:
 
     index_rows, endpoints = parse_reference(pages[REFERENCE_PATH])
     print(f"  Pages: {len(pages)} (guides: {len(pages) - 1})")
-    print(f"  Endpoints: {len(endpoints)} across "
-          f"{len(dict.fromkeys(r for r, _, _, _ in index_rows))} resources")
+    print(
+        f"  Endpoints: {len(endpoints)} across {len(dict.fromkeys(r for r, _, _, _ in index_rows))} resources"
+    )
     if len(endpoints) < 100:
-        print("ERROR: suspiciously few endpoints parsed -- page structure may "
-              "have changed", file=sys.stderr)
+        print("ERROR: suspiciously few endpoints parsed -- page structure may have changed", file=sys.stderr)
         sys.exit(1)
 
     # Resource grouping, in index-table order.
     resources: list[tuple[str, str, list[dict]]] = []
     by_resource: dict[str, list[dict]] = {}
     res_slugs: dict[str, str] = {}
-    for res, anchor, title, desc in index_rows:
+    for res, _anchor, _title, _desc in index_rows:
         if res not in by_resource:
             by_resource[res] = []
             res_slugs[res] = sanitize_filename(res) or "other"
@@ -888,13 +914,15 @@ def sync(args: argparse.Namespace) -> None:
         filename = f"{sanitize_filename(anchor)}.md"
         rel = f"reference/{res_slugs[res]}/{filename}"
         endpoint_files[anchor] = rel
-        by_resource[res].append({
-            "anchor": anchor,
-            "title": ep["title"] or title,
-            "description": desc,
-            "filename": filename,
-            "rel": rel,
-        })
+        by_resource[res].append(
+            {
+                "anchor": anchor,
+                "title": ep["title"] or title,
+                "description": desc,
+                "filename": filename,
+                "rel": rel,
+            }
+        )
     for ep in endpoints:  # endpoints missing from the index table, if any
         if ep["anchor"] not in endpoint_files:
             filename = f"{sanitize_filename(ep['anchor'])}.md"
@@ -904,10 +932,15 @@ def sync(args: argparse.Namespace) -> None:
                 resources.append(("Other", "other", by_resource["Other"]))
             rel = f"reference/other/{filename}"
             endpoint_files[ep["anchor"]] = rel
-            by_resource["Other"].append({
-                "anchor": ep["anchor"], "title": ep["title"],
-                "description": "", "filename": filename, "rel": rel,
-            })
+            by_resource["Other"].append(
+                {
+                    "anchor": ep["anchor"],
+                    "title": ep["title"],
+                    "description": "",
+                    "filename": filename,
+                    "rel": rel,
+                }
+            )
 
     # Guide pages: sidebar order first, crawl-only extras after.
     sidebar = parse_sidebar(pages[API_ROOT])
@@ -916,23 +949,24 @@ def sync(args: argparse.Namespace) -> None:
         if path != REFERENCE_PATH and path not in guide_paths:
             guide_paths.append(path)
 
-    page_files = {path: (f"{page_slug(path)}.md" if path != REFERENCE_PATH
-                         else "reference/README.md")
-                  for path in pages}
+    page_files = {
+        path: (f"{page_slug(path)}.md" if path != REFERENCE_PATH else "reference/README.md") for path in pages
+    }
 
     guides: list[dict] = []
     for path in guide_paths:
         fragment = extract_text_content(pages[path])
         if fragment is None:
-            print(f"WARNING: no text-content section on {path}, skipping",
-                  file=sys.stderr)
+            print(f"WARNING: no text-content section on {path}, skipping", file=sys.stderr)
             continue
-        guides.append({
-            "path": path,
-            "filename": page_files[path],
-            "title": page_title(fragment, pages[path]),
-            "fragment": fragment,
-        })
+        guides.append(
+            {
+                "path": path,
+                "filename": page_files[path],
+                "title": page_title(fragment, pages[path]),
+                "fragment": fragment,
+            }
+        )
 
     if not args.dry_run:
         os.makedirs(DOCS_DIR, exist_ok=True)
@@ -960,7 +994,7 @@ def sync(args: argparse.Namespace) -> None:
                 print(f"  {action} {rel_path}")
         new_cache[rel_path] = {
             "sha256": content_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
         if is_new:
             added += 1
@@ -968,18 +1002,16 @@ def sync(args: argparse.Namespace) -> None:
             updated += 1
 
     for g in guides:
-        write_file(g["filename"],
-                   build_guide_page(g["path"], g["fragment"], g["title"],
-                                    g["filename"], page_files, endpoint_files))
+        write_file(
+            g["filename"],
+            build_guide_page(g["path"], g["fragment"], g["title"], g["filename"], page_files, endpoint_files),
+        )
 
     for resource, slug, entries in resources:
-        write_file(f"reference/{slug}/README.md",
-                   build_resource_readme(resource, entries))
+        write_file(f"reference/{slug}/README.md", build_resource_readme(resource, entries))
         for e in entries:
             ep = ep_by_anchor[e["anchor"]]
-            write_file(e["rel"],
-                       build_endpoint_page(ep, resource, e["rel"],
-                                           page_files, endpoint_files))
+            write_file(e["rel"], build_endpoint_page(ep, resource, e["rel"], page_files, endpoint_files))
 
     write_file("reference/README.md", build_reference_readme(resources))
     write_file("README.md", build_top_readme(guides, resources))
@@ -1007,7 +1039,7 @@ def sync(args: argparse.Namespace) -> None:
                     print(f"  RMDIR {os.path.relpath(root, DOCS_DIR)}/")
         save_cache(new_cache)
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {added}")
     print(f"  Updated:    {updated}")
     print(f"  Unchanged:  {unchanged}")
@@ -1019,12 +1051,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fetch Twitch API docs from dev.twitch.tv and convert to markdown"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-file logging")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

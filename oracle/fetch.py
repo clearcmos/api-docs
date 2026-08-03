@@ -17,7 +17,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -41,18 +41,22 @@ SOURCE_CACHE_PREFIX = "source:"
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def fetch_url(url: str, timeout: int = 60) -> bytes | None:
-    req = Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            data: bytes = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
             return data
@@ -69,8 +73,9 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -84,6 +89,7 @@ def save_cache(cache: dict) -> None:
 # OpenAPI-to-markdown helpers
 # ---------------------------------------------------------------------------
 
+
 def resolve_ref(ref: str, spec: dict) -> dict:
     if not ref.startswith("#/"):
         return {}
@@ -96,8 +102,7 @@ def resolve_ref(ref: str, spec: dict) -> dict:
     return node
 
 
-def schema_to_markdown(schema: dict, spec: dict, depth: int = 0,
-                       seen: set | None = None) -> str:
+def schema_to_markdown(schema: dict, spec: dict, depth: int = 0, seen: set | None = None) -> str:
     if seen is None:
         seen = set()
 
@@ -171,7 +176,7 @@ def schema_to_markdown(schema: dict, spec: dict, depth: int = 0,
     if schema_type:
         fmt = schema.get("format", "")
         enum = schema.get("enum")
-        result = schema_type
+        result = str(schema_type)
         if fmt:
             result += f" ({fmt})"
         if enum:
@@ -269,8 +274,7 @@ def format_responses(responses: dict, spec: dict) -> str:
     return "\n".join(lines)
 
 
-def build_endpoint_markdown(path: str, method: str, operation: dict,
-                            spec: dict, api_title: str) -> str:
+def build_endpoint_markdown(path: str, method: str, operation: dict, spec: dict, api_title: str) -> str:
     lines = []
 
     summary = operation.get("summary", f"{method.upper()} {path}")
@@ -325,8 +329,7 @@ def build_endpoint_markdown(path: str, method: str, operation: dict,
     return "\n".join(lines)
 
 
-def build_tag_readme(tag: str, tag_desc: str, endpoints: list[dict],
-                     api_title: str) -> str:
+def build_tag_readme(tag: str, tag_desc: str, endpoints: list[dict], api_title: str) -> str:
     lines = [f"# {tag}\n"]
     if tag_desc:
         lines.append(f"{tag_desc}\n")
@@ -345,6 +348,7 @@ def build_tag_readme(tag: str, tag_desc: str, endpoints: list[dict],
 # Spec fetching and processing
 # ---------------------------------------------------------------------------
 
+
 def fetch_spec_index() -> dict:
     """Fetch the OCI API spec index."""
     print("Fetching spec index...")
@@ -352,7 +356,11 @@ def fetch_spec_index() -> dict:
     if data is None:
         print("ERROR: Failed to fetch spec index", file=sys.stderr)
         sys.exit(1)
-    return json.loads(data.decode("utf-8"))
+    index = json.loads(data.decode("utf-8"))
+    if not isinstance(index, dict):
+        print("ERROR: Spec index is not a JSON object", file=sys.stderr)
+        sys.exit(1)
+    return index
 
 
 def fetch_spec_file(spec_path: str) -> bytes | None:
@@ -379,8 +387,7 @@ def cached_api_is_complete(api_key: str, info: dict, cache: dict) -> bool:
     return (
         source.get("fingerprint") == spec_fingerprint(info)
         and bool(outputs)
-        and all(os.path.isfile(os.path.join(DOCS_DIR, path))
-                for path in outputs)
+        and all(os.path.isfile(os.path.join(DOCS_DIR, path)) for path in outputs)
     )
 
 
@@ -393,17 +400,14 @@ def carry_api_cache(api_key: str, cache: dict, new_cache: dict) -> None:
             new_cache[key] = value
 
 
-def cached_api_summary(
-    api_key: str, info: dict, cache: dict
-) -> tuple[str, str, int] | None:
+def cached_api_summary(api_key: str, info: dict, cache: dict) -> tuple[str, str, int] | None:
     """Recover catalogue metadata for an API kept after a fetch failure."""
     source = cache.get(f"{SOURCE_CACHE_PREFIX}{api_key}", {})
     endpoint_count = source.get("endpoint_count", 0)
     if not endpoint_count:
-        readme_path = os.path.join(
-            DOCS_DIR, sanitize_filename(api_key), "README.md")
+        readme_path = os.path.join(DOCS_DIR, sanitize_filename(api_key), "README.md")
         try:
-            with open(readme_path, "r") as f:
+            with open(readme_path) as f:
                 readme = f.read()
             match = re.search(r"\*(\d+) endpoints total\*", readme)
             if match:
@@ -411,8 +415,7 @@ def cached_api_summary(
         except OSError:
             pass
     if not endpoint_count:
-        endpoint_count = sum(
-            key.startswith(f"api:{api_key}:") for key in cache)
+        endpoint_count = sum(key.startswith(f"api:{api_key}:") for key in cache)
     if not endpoint_count:
         return None
     return (
@@ -422,9 +425,7 @@ def cached_api_summary(
     )
 
 
-def _parse_yaml_task(
-    task: tuple[str, str, str, bytes]
-) -> tuple[str, str, str, dict | None, str | None]:
+def _parse_yaml_task(task: tuple[str, str, str, bytes]) -> tuple[str, str, str, dict | None, str | None]:
     api_key, toc_title, spec_path, data = task
     try:
         spec = yaml.safe_load(data)
@@ -461,8 +462,8 @@ def download_specs(
         data = fetch_spec_file(spec_path)
         return api_key, toc_title, spec_path, data
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_download, t): t for t in tasks}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as download_pool:
+        futures = {download_pool.submit(_download, t): t for t in tasks}
         done_count = 0
         for future in concurrent.futures.as_completed(futures):
             done_count += 1
@@ -476,21 +477,17 @@ def download_specs(
             elif done_count % 20 == 0:
                 print(f"  ...{done_count}/{len(tasks)} downloaded")
 
-    print(f"Parsing {len(downloaded)} YAML specs with "
-          f"{PARSE_WORKERS} processes...")
+    print(f"Parsing {len(downloaded)} YAML specs with {PARSE_WORKERS} processes...")
     if len(downloaded) < 3:
         parsed = [_parse_yaml_task(task) for task in downloaded]
     else:
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=PARSE_WORKERS
-        ) as pool:
-            parsed = list(pool.map(_parse_yaml_task, downloaded, chunksize=1))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=PARSE_WORKERS) as parse_pool:
+            parsed = list(parse_pool.map(_parse_yaml_task, downloaded, chunksize=1))
 
     candidates: dict[str, list[tuple[str, str, dict]]] = {}
     for api_key, toc_title, spec_path, spec, error in parsed:
         if error or spec is None:
-            print(f"  ERROR parsing {api_key} ({spec_path}): {error}",
-                  file=sys.stderr)
+            print(f"  ERROR parsing {api_key} ({spec_path}): {error}", file=sys.stderr)
             failed_apis.add(api_key)
             continue
         candidates.setdefault(api_key, []).append((toc_title, spec_path, spec))
@@ -507,15 +504,20 @@ def download_specs(
         )
         results[api_key] = (toc_title, spec)
 
-    print(f"Downloaded and parsed {len(results)} APIs "
-          f"({len(failed_apis)} errors)")
+    print(f"Downloaded and parsed {len(results)} APIs ({len(failed_apis)} errors)")
     return results, failed_apis
 
 
-def process_spec(api_key: str, toc_title: str, spec: dict,
-                 cache: dict, new_cache: dict, force: bool,
-                 dry_run: bool, verbose: bool
-                 ) -> tuple[int, int, list[tuple[str, str, int]], list[str]]:
+def process_spec(
+    api_key: str,
+    toc_title: str,
+    spec: dict,
+    cache: dict,
+    new_cache: dict,
+    force: bool,
+    dry_run: bool,
+    verbose: bool,
+) -> tuple[int, int, list[tuple[str, str, int]], list[str]]:
     """Process a single API spec into markdown files.
 
     Returns (written_count, skipped_count, index_entries, output_paths).
@@ -571,7 +573,7 @@ def process_spec(api_key: str, toc_title: str, spec: dict,
 
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
 
             for tag in tags:
@@ -580,16 +582,21 @@ def process_spec(api_key: str, toc_title: str, spec: dict,
                 full_path = os.path.join(tag_dir, filename)
                 output_paths.add(os.path.relpath(full_path, DOCS_DIR))
 
-                tag_endpoints.setdefault(tag, []).append({
-                    "path": path,
-                    "method": method,
-                    "summary": summary,
-                    "filename": filename,
-                })
+                tag_endpoints.setdefault(tag, []).append(
+                    {
+                        "path": path,
+                        "method": method,
+                        "summary": summary,
+                        "filename": filename,
+                    }
+                )
 
-                if (not force and cache_key in cache
-                        and cache[cache_key].get("sha256") == content_hash
-                        and os.path.exists(full_path)):
+                if (
+                    not force
+                    and cache_key in cache
+                    and cache[cache_key].get("sha256") == content_hash
+                    and os.path.exists(full_path)
+                ):
                     skipped += 1
                     continue
 
@@ -613,7 +620,7 @@ def process_spec(api_key: str, toc_title: str, spec: dict,
         cache_key = f"index:{api_key}:{tag}"
         new_cache[cache_key] = {
             "sha256": readme_hash,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
         }
 
         tag_dir = os.path.join(api_dir, tag_slug) if tag_slug != api_dir_name else api_dir
@@ -621,9 +628,12 @@ def process_spec(api_key: str, toc_title: str, spec: dict,
         output_paths.add(os.path.relpath(readme_path, DOCS_DIR))
         index_entries.append((tag_slug, tag, len(endpoints)))
 
-        if (not force and cache_key in cache
-                and cache[cache_key].get("sha256") == readme_hash
-                and os.path.exists(readme_path)):
+        if (
+            not force
+            and cache_key in cache
+            and cache[cache_key].get("sha256") == readme_hash
+            and os.path.exists(readme_path)
+        ):
             continue
 
         if not dry_run:
@@ -673,12 +683,10 @@ def process_spec(api_key: str, toc_title: str, spec: dict,
     return written, skipped, index_entries, sorted(output_paths)
 
 
-def write_top_readme(api_summaries: list[tuple[str, str, int]],
-                     dry_run: bool) -> None:
+def write_top_readme(api_summaries: list[tuple[str, str, int]], dry_run: bool) -> None:
     """Write the top-level docs/README.md."""
     lines = ["# Oracle Cloud Infrastructure API Documentation\n"]
-    lines.append(f"Generated from OCI OpenAPI specs. "
-                 f"{len(api_summaries)} APIs.\n")
+    lines.append(f"Generated from OCI OpenAPI specs. {len(api_summaries)} APIs.\n")
     lines.append("## APIs\n")
     for dir_name, title, endpoint_count in sorted(api_summaries, key=lambda x: x[1].lower()):
         lines.append(f"- [{title}](./{dir_name}/) ({endpoint_count} endpoints)")
@@ -693,18 +701,14 @@ def write_top_readme(api_summaries: list[tuple[str, str, int]],
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fetch Oracle Cloud Infrastructure API documentation")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change, write nothing")
-    parser.add_argument("--force", action="store_true",
-                        help="Ignore cache, regenerate everything")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Per-file logging")
+    parser = argparse.ArgumentParser(description="Fetch Oracle Cloud Infrastructure API documentation")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change, write nothing")
+    parser.add_argument("--force", action="store_true", help="Ignore cache, regenerate everything")
+    parser.add_argument("--verbose", action="store_true", help="Per-file logging")
     args = parser.parse_args()
 
     cache = {} if args.force else load_cache()
-    new_cache = {}
+    new_cache: dict = {}
 
     # Fetch and save the spec index
     index = fetch_spec_index()
@@ -719,17 +723,16 @@ def main():
     # and generated outputs are still complete, avoiding both download and
     # YAML parsing on routine incremental runs.
     unchanged_apis = {
-        api_key for api_key, info in index.items()
+        api_key
+        for api_key, info in index.items()
         if not args.force and cached_api_is_complete(api_key, info, cache)
     }
     changed_apis = set(index) - unchanged_apis
-    print(f"{len(unchanged_apis)} APIs unchanged; "
-          f"{len(changed_apis)} need fetching")
+    print(f"{len(unchanged_apis)} APIs unchanged; {len(changed_apis)} need fetching")
 
     # Download changed specs concurrently and parse the CPU-heavy YAML in
     # separate processes.
-    specs, failed_apis = download_specs(
-        index, verbose=args.verbose, api_keys=changed_apis)
+    specs, failed_apis = download_specs(index, verbose=args.verbose, api_keys=changed_apis)
     failed_apis |= changed_apis - set(specs)
 
     # Process each changed spec into markdown.
@@ -747,22 +750,21 @@ def main():
     print(f"Converting {len(specs)} specs to markdown...")
     for api_key, (toc_title, spec) in sorted(specs.items()):
         written, skipped, index_entries, outputs = process_spec(
-            api_key, toc_title, spec, cache, new_cache,
-            args.force, args.dry_run, args.verbose)
+            api_key, toc_title, spec, cache, new_cache, args.force, args.dry_run, args.verbose
+        )
         total_written += written
         total_skipped += skipped
 
         # Count total endpoints for this API
         total_ep = sum(c for _, _, c in index_entries)
         if total_ep > 0:
-            api_summaries[api_key] = (
-                sanitize_filename(api_key), toc_title, total_ep)
+            api_summaries[api_key] = (sanitize_filename(api_key), toc_title, total_ep)
             new_cache[f"{SOURCE_CACHE_PREFIX}{api_key}"] = {
                 "fingerprint": spec_fingerprint(index[api_key]),
                 "toc_title": toc_title,
                 "endpoint_count": total_ep,
                 "outputs": outputs,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
 
         if args.verbose:
@@ -802,8 +804,10 @@ def main():
     if not args.dry_run:
         save_cache(new_cache)
 
-    print(f"\nDone: {total_written} written, {total_skipped} cached, "
-          f"{removed} removed, {len(api_summaries)} APIs")
+    print(
+        f"\nDone: {total_written} written, {total_skipped} cached, "
+        f"{removed} removed, {len(api_summaries)} APIs"
+    )
 
 
 if __name__ == "__main__":

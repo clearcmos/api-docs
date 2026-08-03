@@ -18,7 +18,8 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -36,16 +37,19 @@ def sha256(content: str) -> str:
 
 
 def fetch_url(url: str, timeout: int = 60) -> str | None:
-    req = Request(url, headers={
-        "User-Agent": "sonarr-api-docs-fetcher/1.0",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "sonarr-api-docs-fetcher/1.0",
+            "Accept-Encoding": "gzip",
+        },
+    )
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
             if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                 data = gzip.decompress(data)
-            return data.decode("utf-8")
+            return cast(str, data.decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, OSError) as e:
         print(f"ERROR: Failed to fetch {url}: {e}", file=sys.stderr)
         return None
@@ -59,8 +63,8 @@ def sanitize_filename(name: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict[str, Any], json.load(f))
     return {}
 
 
@@ -89,7 +93,7 @@ def resolve_server_url(spec: dict) -> str:
     if not servers:
         return ""
     server = servers[0]
-    url = server.get("url", "")
+    url = cast(str, server.get("url", ""))
     for var, info in server.get("variables", {}).items():
         url = url.replace("{" + var + "}", str(info.get("default", "")))
     return url
@@ -179,7 +183,7 @@ def schema_to_markdown(schema: dict, spec: dict, depth: int = 0, seen: set | Non
             if len(enum) > 10:
                 enum_str += f", ... ({len(enum)} total)"
             result += f" -- enum: {enum_str}"
-        return result
+        return cast(str, result)
 
     return "any"
 
@@ -356,7 +360,7 @@ def sync(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     spec = json.loads(raw)
-    spec_hash = sha256(raw)
+    sha256(raw)
     print(f"  OpenAPI version: {spec.get('openapi', '?')}")
     print(f"  API version: {spec.get('info', {}).get('version', '?')}")
 
@@ -387,13 +391,15 @@ def sync(args: argparse.Namespace) -> None:
             filename = f"{safe_name}.md"
 
             for tag in tags:
-                endpoints_by_tag.setdefault(tag, []).append({
-                    "path": path,
-                    "method": method,
-                    "summary": summary,
-                    "filename": filename,
-                    "operation": operation,
-                })
+                endpoints_by_tag.setdefault(tag, []).append(
+                    {
+                        "path": path,
+                        "method": method,
+                        "summary": summary,
+                        "filename": filename,
+                        "operation": operation,
+                    }
+                )
 
     print(f"  Tags: {len(endpoints_by_tag)}")
 
@@ -434,7 +440,7 @@ def sync(args: argparse.Namespace) -> None:
                     print(f"  {'ADD' if is_new else 'UPDATE'} {safe_tag}/README.md")
             new_cache[cache_key] = {
                 "sha256": content_hash,
-                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
             }
             if is_new:
                 added += 1
@@ -462,7 +468,7 @@ def sync(args: argparse.Namespace) -> None:
                         print(f"  {'ADD' if is_new else 'UPDATE'} {safe_tag}/{ep['filename']}")
                 new_cache[cache_key] = {
                     "sha256": content_hash,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "last_updated": datetime.now(UTC).isoformat(),
                 }
                 if is_new:
                     added += 1
@@ -534,7 +540,7 @@ def sync(args: argparse.Namespace) -> None:
 
     total_endpoints = sum(len(eps) for eps in endpoints_by_tag.values())
 
-    print(f"\nSync complete:")
+    print("\nSync complete:")
     print(f"  Added:      {added}")
     print(f"  Updated:    {updated}")
     print(f"  Unchanged:  {unchanged}")
@@ -558,9 +564,7 @@ def main():
         action="store_true",
         help="Re-generate everything ignoring cache",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Detailed per-file logging"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-file logging")
     args = parser.parse_args()
     sync(args)
 

@@ -1,4 +1,4 @@
-# api-docs
+# external-docs
 
 Collection of fetcher scripts that pull API documentation from vendor sources and convert to local markdown. Each vendor lives in its own directory.
 
@@ -275,3 +275,26 @@ python run.py terraform -- --provider org/name   # vendor-specific args after --
 Vendors marked with `# requires-interactive` or having `required=True` argparse args are skipped in `--all` mode. The `--` separator forwards everything after it to the vendor script.
 
 When adding a new fetcher, `run.py` picks it up automatically -- no registration needed.
+
+## Development
+
+The supported runtime is Python 3.12 and newer. Use the locked `uv` environment for development and CI:
+
+```sh
+uv sync --frozen --all-groups
+uv run ruff check .
+uv run ruff format --check .
+for source in run.py */fetch.py; do uv run mypy "$source" || exit; done
+uv run coverage run -m pytest
+uv run coverage report --fail-under=85
+```
+
+Tests are offline and behavior-focused. Mock network and process boundaries, use representative vendor fixtures for parsers, and exercise cache hits, missing-output repair, transient-failure preservation, and scope-safe removal where those behaviors apply. Every `fetch.py` requires a matching test module unless its network-bound portion has a documented exemption.
+
+Dependencies are updated deliberately rather than by an automated bot. Change the direct constraints in `pyproject.toml`, run `uv lock --upgrade`, and complete the full verification before committing `uv.lock`. Git history serves as the changelog. The repository is distributed by cloning it; it does not publish a Python package.
+
+## Decision log
+
+- 2026-08-03: Use one hardened Ubuntu CI workflow with a Python 3.12 through 3.14 matrix. The fetchers produce platform-neutral Markdown and do not justify an operating-system matrix.
+- 2026-08-03: Keep vendor fetchers standalone instead of introducing a shared runtime package. Their source-specific behavior and direct executability are intentional; common guarantees are enforced through tests and conventions.
+- 2026-08-03: Keep tests hermetic. Live vendor availability, credentials, rate limits, and mutable upstream content are unsuitable CI dependencies.

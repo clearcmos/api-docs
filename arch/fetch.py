@@ -43,7 +43,8 @@ import sys
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -64,24 +65,67 @@ MAX_BATCH_WORKERS = 2
 # Languages used as suffixes on translated Arch Wiki articles. A title
 # ending with " (X)" where X is one of these is treated as non-English and
 # skipped. Sourced from the Arch Wiki language nav at the bottom of articles.
-LANGUAGE_SUFFIXES = frozenset({
-    "Bahasa Indonesia", "Bosanski", "Català", "Čeština", "Dansk", "Deutsch",
-    "Eesti", "Español", "Esperanto", "Euskara", "Français", "Hrvatski",
-    "Italiano", "Lietuvių", "Magyar", "Nederlands", "Norsk Bokmål", "Polski",
-    "Português", "Português (Brasil)", "Qhichwa", "Română", "Slovenčina",
-    "Slovenský", "Slovenščina", "Suomi", "Svenska", "Türkçe", "Tiếng Việt",
-    "Ελληνικά", "Български", "Қазақша", "Македонски", "Русский", "Српски",
-    "Українська",
-    "العربية", "עברית", "فارسی", "हिन्दी", "ไทย", "বাংলা",
-    "中文 (简体)", "中文 (繁體)", "中文（简体）", "中文（繁體）",
-    "文言文", "正體中文", "粵語",
-    "日本語", "한국어",
-})
+LANGUAGE_SUFFIXES = frozenset(
+    {
+        "Bahasa Indonesia",
+        "Bosanski",
+        "Català",
+        "Čeština",
+        "Dansk",
+        "Deutsch",
+        "Eesti",
+        "Español",
+        "Esperanto",
+        "Euskara",
+        "Français",
+        "Hrvatski",
+        "Italiano",
+        "Lietuvių",
+        "Magyar",
+        "Nederlands",
+        "Norsk Bokmål",
+        "Polski",
+        "Português",
+        "Português (Brasil)",
+        "Qhichwa",
+        "Română",
+        "Slovenčina",
+        "Slovenský",
+        "Slovenščina",
+        "Suomi",
+        "Svenska",
+        "Türkçe",
+        "Tiếng Việt",
+        "Ελληνικά",
+        "Български",
+        "Қазақша",
+        "Македонски",
+        "Русский",
+        "Српски",
+        "Українська",
+        "العربية",
+        "עברית",
+        "فارسی",
+        "हिन्दी",
+        "ไทย",
+        "বাংলা",
+        "中文 (简体)",
+        "中文 (繁體)",
+        "中文（简体）",
+        "中文（繁體）",
+        "文言文",
+        "正體中文",
+        "粵語",
+        "日本語",
+        "한국어",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
 
 def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -89,8 +133,8 @@ def sha256(content: str) -> str:
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r") as f:
-            return json.load(f)
+        with open(CACHE_FILE) as f:
+            return cast(dict, json.load(f))
     return {}
 
 
@@ -101,11 +145,14 @@ def save_cache(cache: dict) -> None:
 
 
 def http_get_json(url: str, timeout: int = 60, retries: int = 3) -> dict | None:
-    req = Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-    })
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+        },
+    )
     last_err: Exception | None = None
     for attempt in range(retries):
         try:
@@ -113,7 +160,7 @@ def http_get_json(url: str, timeout: int = 60, retries: int = 3) -> dict | None:
                 data = resp.read()
                 if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                     data = gzip.decompress(data)
-                return json.loads(data.decode("utf-8"))
+                return cast(dict, json.loads(data.decode("utf-8")))
         except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
             last_err = e
             if attempt < retries - 1:
@@ -170,17 +217,13 @@ def is_tracking_category(cat: str) -> bool:
         return True
     # Localized categories like "About Arch (Bosanski)" -- same suffix
     # pattern used to filter translated article titles.
-    if is_translated_title(cat):
-        return True
-    return False
+    return bool(is_translated_title(cat))
 
 
 def is_translated_title(title: str) -> bool:
     """Detect translations by their " (Language)" suffix pattern."""
     m = re.search(r"\s\(([^()]+)\)$", title)
-    if m and m.group(1) in LANGUAGE_SUFFIXES:
-        return True
-    return False
+    return bool(m and m.group(1) in LANGUAGE_SUFFIXES)
 
 
 def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: str) -> None:
@@ -198,6 +241,7 @@ def write_file(path: str, content: str, *, dry_run: bool, verbose: bool, label: 
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
+
 
 def discover_titles(verbose: bool = False) -> list[str]:
     """Page through list=allpages and return all English article titles."""
@@ -279,9 +323,7 @@ def discover_revisions(verbose: bool = False) -> dict[str, int]:
     return dict(sorted(revisions.items(), key=lambda item: item[0].lower()))
 
 
-def fetch_pages_bulk(
-    titles: list[str], verbose: bool = False
-) -> tuple[dict[str, dict], int]:
+def fetch_pages_bulk(titles: list[str], verbose: bool = False) -> tuple[dict[str, dict], int]:
     """Fetch wikitext + categories for all titles via batched API calls.
 
     Returns ({title: {"wikitext": str, "categories": [str, ...]}},
@@ -292,6 +334,7 @@ def fetch_pages_bulk(
     `prop=revisions|categories`. Categories may paginate beyond cllimit when
     a batch has many; the continuation is followed transparently.
     """
+
     def fetch_batch(batch: list[str]) -> tuple[dict[str, dict], bool]:
         merged: dict[str, dict] = {}
         cont: dict | None = None
@@ -320,8 +363,7 @@ def fetch_pages_bulk(
                 title = p.get("title")
                 if not title:
                     continue
-                entry = merged.setdefault(
-                    title, {"wikitext": None, "categories": []})
+                entry = merged.setdefault(title, {"wikitext": None, "categories": []})
                 revs = p.get("revisions") or []
                 if revs and entry["wikitext"] is None:
                     slot = revs[0].get("slots", {}).get("main", {})
@@ -331,7 +373,7 @@ def fetch_pages_bulk(
                 for c in p.get("categories", []) or []:
                     name = c.get("title", "")
                     if name.startswith("Category:"):
-                        name = name[len("Category:"):]
+                        name = name[len("Category:") :]
                     if name and name not in entry["categories"]:
                         entry["categories"].append(name)
             cont = data.get("continue")
@@ -342,10 +384,7 @@ def fetch_pages_bulk(
 
     out: dict[str, dict] = {}
     total_batches = (len(titles) + BATCH_SIZE - 1) // BATCH_SIZE
-    batches = [
-        titles[i:i + BATCH_SIZE]
-        for i in range(0, len(titles), BATCH_SIZE)
-    ]
+    batches = [titles[i : i + BATCH_SIZE] for i in range(0, len(titles), BATCH_SIZE)]
     failed_batches = 0
     with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKERS) as pool:
         futures = {pool.submit(fetch_batch, batch): batch for batch in batches}
@@ -357,8 +396,7 @@ def fetch_pages_bulk(
                 if entry["wikitext"] is not None:
                     out[title] = entry
             if verbose:
-                print(f"  batch {done}/{total_batches}: "
-                      f"{len(out)} pages so far")
+                print(f"  batch {done}/{total_batches}: {len(out)} pages so far")
     return out, failed_batches
 
 
@@ -384,13 +422,53 @@ _RE_HTML_BOLD = re.compile(r"<(b|strong)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
 _RE_HTML_ITAL = re.compile(r"<(i|em)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
 _RE_HTML_KBD = re.compile(r"<(kbd|tt)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
 _RE_INTERWIKI = re.compile(
-    r"\[\[(?:Category|File|Image|" +
-    r"|".join(re.escape(p) for p in [
-        "de", "es", "fr", "ja", "ru", "uk", "zh-hans", "zh-hant", "zh-cn",
-        "pt", "tr", "it", "pl", "fa", "ar", "ko", "vi", "fi", "cs", "hu",
-        "ro", "el", "bg", "kk", "mk", "sr", "hr", "nl", "sv", "no", "da",
-        "id", "th", "he", "hi", "ca", "et", "eu", "lt", "sk",
-    ]) + r"):[^\]]*\]\]"
+    r"\[\[(?:Category|File|Image|"
+    + r"|".join(
+        re.escape(p)
+        for p in [
+            "de",
+            "es",
+            "fr",
+            "ja",
+            "ru",
+            "uk",
+            "zh-hans",
+            "zh-hant",
+            "zh-cn",
+            "pt",
+            "tr",
+            "it",
+            "pl",
+            "fa",
+            "ar",
+            "ko",
+            "vi",
+            "fi",
+            "cs",
+            "hu",
+            "ro",
+            "el",
+            "bg",
+            "kk",
+            "mk",
+            "sr",
+            "hr",
+            "nl",
+            "sv",
+            "no",
+            "da",
+            "id",
+            "th",
+            "he",
+            "hi",
+            "ca",
+            "et",
+            "eu",
+            "lt",
+            "sk",
+        ]
+    )
+    + r"):[^\]]*\]\]"
 )
 _RE_MAGIC_WORD = re.compile(r"__[A-Z_]+__")
 _RE_LIST_LINE = re.compile(r"^([*#:;]+)(?:\s+(.*)|$)")
@@ -426,6 +504,7 @@ def _convert_inline(text: str) -> str:
         url = m.group(1)
         label = (m.group(2) or url).strip()
         return f"[{label}]({url})"
+
     text = _RE_EXTERNAL_LINK.sub(_ext, text)
 
     # Internal links: [[Page]] or [[Page|Display]] or [[Page#anchor|Display]]
@@ -444,12 +523,14 @@ def _convert_inline(text: str) -> str:
         else:
             url = title_to_url(target)
         return f"[{display}]({url})"
+
     text = _RE_INTERNAL_LINK.sub(_internal, text)
 
     return text
 
 
 # ---- Templates -------------------------------------------------------------
+
 
 def _convert_templates_inline(text: str) -> str:
     """Replace common inline templates with markdown equivalents.
@@ -587,7 +668,7 @@ def _split_template_args(body: str) -> list[str]:
     args: list[str] = []
     depth_brace = 0
     depth_brack = 0
-    cur = []
+    cur: list[str] = []
     for ch in body:
         if ch == "{" and depth_brace == 0:
             # could be start of {{ -- track curly depth roughly
@@ -610,8 +691,11 @@ def _split_template_args(body: str) -> list[str]:
 def _render_admonition(kind: str, body: str) -> list[str]:
     """Render a Note / Warning / Tip block to a markdown blockquote."""
     label_map = {
-        "note": "Note", "warning": "Warning", "tip": "Tip",
-        "important": "Important", "caution": "Caution",
+        "note": "Note",
+        "warning": "Warning",
+        "tip": "Tip",
+        "important": "Important",
+        "caution": "Caution",
     }
     label = label_map.get(kind.lower(), kind.capitalize())
     out = [f"> **{label}:** {body.strip().splitlines()[0]}" if body.strip() else f"> **{label}**"]
@@ -651,6 +735,7 @@ def _convert_related_articles(text: str) -> str:
     """Replace `{{Related articles start}}...{{Related articles end}}` blocks
     with a "Related articles" markdown section.
     """
+
     def replace(m: re.Match) -> str:
         body = m.group(1)
         items = []
@@ -676,6 +761,7 @@ def _strip_layout_templates(text: str) -> str:
 
 # ---- Top-level converter ---------------------------------------------------
 
+
 def wikitext_to_markdown(text: str) -> str:
     """Convert a wikitext document to markdown.
 
@@ -692,10 +778,8 @@ def wikitext_to_markdown(text: str) -> str:
     out: list[str] = []
     i = 0
     n = len(text)
-    in_pre_block = False        # <pre> ... </pre>
-    in_syntax_block = False     # <syntaxhighlight lang="X"> ...
-    in_table = False
-    table_buf: list[str] = []
+    in_pre_block = False  # <pre> ... </pre>
+    in_syntax_block = False  # <syntaxhighlight lang="X"> ...
 
     # We do block-level scanning by walking the source character by character
     # to handle multi-line constructs (templates, syntaxhighlight, tables).
@@ -763,7 +847,7 @@ def wikitext_to_markdown(text: str) -> str:
             if close != -1:
                 end_close = text.find("</pre>", close)
                 if end_close != -1:
-                    body = text[close + 1:end_close]
+                    body = text[close + 1 : end_close]
                     if out and out[-1].strip():
                         out.append("")
                     out.extend(_render_code_block("", body))
@@ -780,7 +864,7 @@ def wikitext_to_markdown(text: str) -> str:
                 lang = m.group(1) if m else ""
                 end_close = text.find(f"</{tag}>", close)
                 if end_close != -1:
-                    body = text[close + 1:end_close]
+                    body = text[close + 1 : end_close]
                     if out and out[-1].strip():
                         out.append("")
                     out.extend(_render_code_block(lang, body))
@@ -905,6 +989,7 @@ def _post_process(lines: list[str]) -> str:
 
 # ---- Tables ----------------------------------------------------------------
 
+
 def _find_table_end(text: str, start: int) -> int:
     depth = 0
     i = start
@@ -1002,14 +1087,13 @@ def _clean_cell(c: str) -> str:
 # Markdown assembly
 # ---------------------------------------------------------------------------
 
+
 def build_page_markdown(title: str, body: str, categories: list[str]) -> str:
     src = title_to_url(title)
     parts = [f"# {title}", "", f"*Source: [{src}]({src})*"]
     cats = [c for c in categories if not is_tracking_category(c)]
     if cats:
-        cat_links = ", ".join(
-            f"[{c}](./_categories/{category_to_filename(c)})" for c in sorted(cats)
-        )
+        cat_links = ", ".join(f"[{c}](./_categories/{category_to_filename(c)})" for c in sorted(cats))
         parts += ["", f"**Categories:** {cat_links}"]
     parts += ["", body.rstrip(), ""]
     return "\n".join(parts)
@@ -1045,22 +1129,27 @@ def build_categories_index(category_members: dict[str, list[str]]) -> str:
 
 def build_top_readme(total_articles: int, total_categories: int) -> str:
     lines = ["# Arch Linux Wiki (English)", ""]
-    lines.append(f"Mirror of [{BASE}]({BASE}). {total_articles} English "
-                 "articles as flat markdown files; each article carries its "
-                 "categories inline and is indexed under "
-                 "[`_categories/`](./_categories/) by topic.")
+    lines.append(
+        f"Mirror of [{BASE}]({BASE}). {total_articles} English "
+        "articles as flat markdown files; each article carries its "
+        "categories inline and is indexed under "
+        "[`_categories/`](./_categories/) by topic."
+    )
     lines.append("")
     lines.append(f"- {total_articles} articles at the root (one `.md` per page)")
     lines.append(f"- {total_categories} category indexes under [`_categories/`](./_categories/)")
     lines.append("")
     lines.append("## Conventions")
     lines.append("")
-    lines.append("- Article filenames replace spaces and subpage `/` separators with `_`. "
-                 "For example `Pacman/Tips and tricks` becomes `Pacman_Tips_and_tricks.md`.")
-    lines.append("- Each article starts with the source URL and a `**Categories:**` line "
-                 "linking to the local category index files.")
-    lines.append("- Maintenance/tracking categories (`Pages or sections flagged with ...`) are "
-                 "filtered out.")
+    lines.append(
+        "- Article filenames replace spaces and subpage `/` separators with `_`. "
+        "For example `Pacman/Tips and tricks` becomes `Pacman_Tips_and_tricks.md`."
+    )
+    lines.append(
+        "- Each article starts with the source URL and a `**Categories:**` line "
+        "linking to the local category index files."
+    )
+    lines.append("- Maintenance/tracking categories (`Pages or sections flagged with ...`) are filtered out.")
     lines.append("")
     return "\n".join(lines)
 
@@ -1068,6 +1157,7 @@ def build_top_readme(total_articles: int, total_categories: int) -> str:
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
+
 
 def sync(args: argparse.Namespace) -> None:
     cache: dict = {} if args.force else load_cache()
@@ -1077,14 +1167,13 @@ def sync(args: argparse.Namespace) -> None:
     try:
         revisions = discover_revisions(verbose=args.verbose)
     except RuntimeError as e:
-        print(f"ERROR: {e}; leaving the existing mirror untouched",
-              file=sys.stderr)
+        print(f"ERROR: {e}; leaving the existing mirror untouched", file=sys.stderr)
         sys.exit(1)
     titles = list(revisions)
     print(f"  {len(titles)} English articles found")
 
     if args.limit:
-        titles = titles[:args.limit]
+        titles = titles[: args.limit]
         revisions = {title: revisions[title] for title in titles}
         print(f"  --limit applied: trimmed to {len(titles)}")
 
@@ -1101,15 +1190,15 @@ def sync(args: argparse.Namespace) -> None:
             continue
         titles_to_fetch.append(title)
 
-    print(f"  {len(titles) - len(titles_to_fetch)} revisions unchanged; "
-          f"{len(titles_to_fetch)} need content")
-    print(f"\nFetching changed wikitext (batches of {BATCH_SIZE}, "
-          f"concurrency={MAX_BATCH_WORKERS})...")
-    pages, failed_batches = fetch_pages_bulk(
-        titles_to_fetch, verbose=args.verbose)
+    print(f"  {len(titles) - len(titles_to_fetch)} revisions unchanged; {len(titles_to_fetch)} need content")
+    print(f"\nFetching changed wikitext (batches of {BATCH_SIZE}, concurrency={MAX_BATCH_WORKERS})...")
+    pages, failed_batches = fetch_pages_bulk(titles_to_fetch, verbose=args.verbose)
     if failed_batches:
-        print(f"ERROR: {failed_batches} page batches failed after retries; "
-              "leaving the existing mirror untouched", file=sys.stderr)
+        print(
+            f"ERROR: {failed_batches} page batches failed after retries; "
+            "leaving the existing mirror untouched",
+            file=sys.stderr,
+        )
         sys.exit(1)
     print(f"  fetched {len(pages)} changed pages")
 
@@ -1124,7 +1213,9 @@ def sync(args: argparse.Namespace) -> None:
     category_members: dict[str, list[str]] = {}
 
     def commit(
-        rel: str, content: str, label_for_log: str,
+        rel: str,
+        content: str,
+        label_for_log: str,
         metadata: dict | None = None,
     ) -> None:
         nonlocal unchanged
@@ -1136,11 +1227,12 @@ def sync(args: argparse.Namespace) -> None:
             new_cache[rel] = {**prev, **(metadata or {})}
             return
         is_new = rel not in cache or not os.path.exists(out_path)
-        write_file(out_path, content, dry_run=args.dry_run, verbose=args.verbose,
-                   label="ADD" if is_new else "UPDATE")
+        write_file(
+            out_path, content, dry_run=args.dry_run, verbose=args.verbose, label="ADD" if is_new else "UPDATE"
+        )
         new_cache[rel] = {
             "sha256": digest,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(UTC).isoformat(),
             "title": label_for_log,
             **(metadata or {}),
         }
@@ -1180,10 +1272,15 @@ def sync(args: argparse.Namespace) -> None:
             body_md = wikitext_to_markdown(page["wikitext"])
             cats = page.get("categories", []) or []
             page_md = build_page_markdown(title, body_md, cats)
-            commit(rel, page_md, title, {
-                "revision": revisions[title],
-                "categories": cats,
-            })
+            commit(
+                rel,
+                page_md,
+                title,
+                {
+                    "revision": revisions[title],
+                    "categories": cats,
+                },
+            )
 
         for c in cats:
             if is_tracking_category(c):
@@ -1261,17 +1358,13 @@ def sync(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Mirror the English Arch Linux Wiki as local markdown"
+    parser = argparse.ArgumentParser(description="Mirror the English Arch Linux Wiki as local markdown")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing files")
+    parser.add_argument("--force", action="store_true", help="Re-generate everything, ignoring cache")
+    parser.add_argument("--verbose", action="store_true", help="Detailed per-batch and per-page logging")
+    parser.add_argument(
+        "--limit", type=int, default=0, help="Process at most this many articles (for testing)"
     )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would change without writing files")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-generate everything, ignoring cache")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Detailed per-batch and per-page logging")
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Process at most this many articles (for testing)")
     args = parser.parse_args()
     sync(args)
 
